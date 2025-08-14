@@ -726,6 +726,9 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
+        if self.server_args.enable_mixed_attention:
+            self.load_config.load_format = "mixed"
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -1633,6 +1636,12 @@ class ModelRunner:
                 )
 
                 return DoubleSparseAttnBackend(self)
+            elif self.server_args.enable_mixed_attention:
+                from sglang.srt.layers.attention.mixed_triton_backend import (
+                    MixedTritonAttnBackend,
+                )
+
+                return MixedTritonAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

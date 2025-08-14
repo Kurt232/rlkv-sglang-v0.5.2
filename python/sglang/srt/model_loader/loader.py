@@ -1525,6 +1525,46 @@ class RemoteModelLoader(BaseModelLoader):
         return model.eval()
 
 
+class MixedModelLoader(DefaultModelLoader):
+    def __init__(self, load_config: LoadConfig):
+        load_config.load_format = LoadFormat.AUTO
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+        dtype = next(model.parameters()).dtype
+        for layer in model.model.layers:
+            module = layer.self_attn.attn  # RadixAttention
+            module.register_parameter(
+                "alpha_weight",
+                nn.Parameter(
+                    torch.ones(
+                        layer.self_attn.total_num_kv_heads,
+                        device=target_device,
+                        dtype=dtype,
+                    )
+                ),
+            )
+
+        self.load_weights_and_postprocess(
+            model, self._get_all_weights(model_config, model), target_device
+        )
+
+        return model.eval()
+
+
 def load_model_with_cpu_quantization(
     self,
     *,
@@ -1580,5 +1620,8 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.MIXED:
+        return MixedModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

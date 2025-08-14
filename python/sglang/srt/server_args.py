@@ -326,6 +326,11 @@ class ServerArgs:
     offload_prefetch_step: int = 1
     offload_mode: str = "cpu"
 
+    # Mixed attention
+    enable_mixed_attention: bool = True
+    sink_window_size: int = 16
+    recent_window_size: int = 32
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -1870,6 +1875,25 @@ class ServerArgs:
             type=str,
             default=ServerArgs.offload_mode,
             help="Mode of offloading.",
+        )
+
+        # Mixed attention
+        parser.add_argument(
+            "--enable-mixed-attention",
+            action="store_true",
+            help="Enable mixed attention.",
+        )
+        parser.add_argument(
+            "--sink-window-size",
+            type=int,
+            default=ServerArgs.sink_window_size,
+            help="The sink window size for mixed attention.",
+        )
+        parser.add_argument(
+            "--recent-window-size",
+            type=int,
+            default=ServerArgs.recent_window_size,
+            help="The recent window size for mixed attention.",
         )
 
         # Optimization/debug options

@@ -97,3 +97,60 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+@triton.jit
+def create_streaming_window_kv_indices_triton(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    kv_indptr_ptr,
+    kv_indices_ptr,
+    sink_window_size,
+    recent_window_size,
+    req_to_token_stride,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_idx = tl.load(req_pool_indices_ptr + pid)
+    seq_len = tl.load(seq_lens_ptr + pid)
+
+    kv_start = tl.load(kv_indptr_ptr + pid)
+    kv_end = tl.load(kv_indptr_ptr + pid + 1)
+
+    req_to_token_offset = req_idx * req_to_token_stride
+    offs = tl.arange(0, BLOCK_SIZE)
+    kv_indices_offs = kv_start + offs
+    mask = kv_indices_offs < kv_end
+
+    if seq_len <= sink_window_size + recent_window_size:
+        # Contiguous window from start
+        token_indices_in_seq = offs
+        token_physical_indices = tl.load(
+            req_to_token_ptr + req_to_token_offset + token_indices_in_seq, mask=mask
+        )
+        tl.store(kv_indices_ptr + kv_indices_offs, token_physical_indices, mask=mask)
+    else:
+        # Disjoint window: sink + recent
+        # Sink tokens
+        sink_mask = mask & (offs < sink_window_size)
+        token_indices_in_seq = offs
+        token_physical_indices = tl.load(
+            req_to_token_ptr + req_to_token_offset + token_indices_in_seq,
+            mask=sink_mask,
+        )
+        tl.store(
+            kv_indices_ptr + kv_indices_offs, token_physical_indices, mask=sink_mask
+        )
+
+        # Recent tokens
+        recent_mask = mask & (offs >= sink_window_size)
+        token_indices_in_seq = seq_len - recent_window_size + (offs - sink_window_size)
+        token_physical_indices = tl.load(
+            req_to_token_ptr + req_to_token_offset + token_indices_in_seq,
+            mask=recent_mask,
+        )
+        tl.store(
+            kv_indices_ptr + kv_indices_offs, token_physical_indices, mask=recent_mask
+        )
