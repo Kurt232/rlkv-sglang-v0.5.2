@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -558,12 +557,10 @@ class MixedTritonAttnBackend(AttentionBackend):
             layer.logit_cap,
         )
 
-        tp_rank = get_tensor_model_parallel_rank()
-        # layer.alpha_weight: [num_total_kv_heads]
-        alpha_weight = (
-            layer.alpha_weight.view(-1, self.num_kv_head)[tp_rank]
-            .repeat_interleave(self.num_kv_groups)
-            .view(1, -1, 1)
+        # layer.alpha_weight: originally [num_total_kv_heads];
+        # after TP slicing, current rank sees [num_kv_heads]
+        alpha_weight = layer.alpha_weight.repeat_interleave(self.num_kv_groups).view(
+            1, -1, 1
         )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
 
         # Reshape o_full and o_streaming for element-wise multiplication with alpha_weight
