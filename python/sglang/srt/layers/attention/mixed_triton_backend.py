@@ -8,10 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import (
-    create_flashinfer_kv_indices_triton,
-    create_streaming_window_kv_indices_triton,
-)
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -34,10 +31,6 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
-    # For streaming window
-    window_kv_indptr: torch.Tensor
-    window_kv_indices: torch.Tensor
-    window_num_kv_splits: torch.Tensor
 
 
 class MixedTritonAttnBackend(AttentionBackend):
@@ -54,10 +47,16 @@ class MixedTritonAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
+        from sglang.srt.layers.attention.triton_ops.streaming_decode_attention import (
+            streaming_decode_attention_fwd,
+        )
 
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.streaming_decode_attention_fwd = torch.compiler.disable(
+            streaming_decode_attention_fwd
+        )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
         self.skip_prefill = skip_prefill
@@ -77,14 +76,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             )
         else:
             self.kv_indptr = kv_indptr_buf
-
-        if kv_indptr_buf is None:
-            self.window_kv_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            )
-        else:
-            # When provided a buffer, create a clone for the second buffer
-            self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -158,12 +149,6 @@ class MixedTritonAttnBackend(AttentionBackend):
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
-
-        sink_window_size = self.sink_window_size
-        recent_window_size = self.recent_window_size
 
         if forward_batch.forward_mode.is_decode_or_idle():
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -180,23 +165,6 @@ class MixedTritonAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-            # streaming window
-            window_kv_indptr, window_kv_indices, window_kv_lens = (
-                update_streaming_window_buffer(
-                    self.window_kv_indptr,
-                    self.req_to_token,
-                    sink_window_size,
-                    recent_window_size,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    bs,
-                    self.device,
-                )
-            )
-            window_num_kv_splits = torch.empty(
-                (bs,), dtype=torch.int32, device=self.device
-            )
-            self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
 
             attn_logits = torch.empty(
                 (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -256,9 +224,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
-            window_kv_indptr,
-            window_kv_indices,
-            window_num_kv_splits,
         )
 
     def init_cuda_graph_state(
@@ -296,23 +261,6 @@ class MixedTritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        # Add for streaming window
-        if kv_indices_buf is None:
-            self.cuda_graph_window_kv_indices = torch.zeros(
-                (max_num_tokens * (self.sink_window_size + self.recent_window_size)),
-                dtype=torch.int32,
-                device=self.device,
-            )
-        else:
-            self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
-
-        self.cuda_graph_window_num_kv_splits = torch.full(
-            (max_num_tokens,),
-            self.max_kv_splits,
-            dtype=torch.int32,
-            device=self.device,
-        )
-
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -328,9 +276,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             raise ValueError(
                 f"Speculative decoding is not supported with MixedTritonAttnBackend."
             )
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
 
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr
@@ -345,19 +290,6 @@ class MixedTritonAttnBackend(AttentionBackend):
                 None,
                 kv_indices,
                 self.req_to_token.stride(0),
-            )
-
-            window_kv_indices = self.cuda_graph_window_kv_indices
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_indptr, _ = update_streaming_window_buffer_cuda_graph(
-                self.window_kv_indptr,
-                window_kv_indices,
-                self.req_to_token,
-                self.sink_window_size,
-                self.recent_window_size,
-                seq_lens[:bs],
-                req_pool_indices,
-                bs,
             )
 
             attn_logits = self.cuda_graph_attn_logits
@@ -383,9 +315,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
-            window_kv_indptr,
-            window_kv_indices,
-            window_num_kv_splits,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -424,23 +353,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             num_token = bs
 
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
-
-            # Update streaming window buffers for CUDA graph replay
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_indices = self.cuda_graph_window_kv_indices
-            _, window_kv_lens = update_streaming_window_buffer_cuda_graph(
-                self.window_kv_indptr,
-                window_kv_indices,
-                self.req_to_token,
-                self.sink_window_size,
-                self.recent_window_size,
-                seq_lens[:bs],
-                req_pool_indices[:bs],
-                bs,
-            )
-            self.get_num_kv_splits(
-                window_num_kv_splits[:num_token], window_kv_lens[:bs]
-            )
 
         else:
             raise ValueError(
@@ -492,7 +404,7 @@ class MixedTritonAttnBackend(AttentionBackend):
             layer.logit_cap,
             sliding_window_size,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -509,12 +421,12 @@ class MixedTritonAttnBackend(AttentionBackend):
 
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
-            o_full = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
             o_streaming = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
             )
         else:
-            o_full = torch.empty_like(q)
+            o = torch.empty_like(q)
             o_streaming = torch.empty_like(q)
 
         if save_kv_cache:
@@ -530,7 +442,7 @@ class MixedTritonAttnBackend(AttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k_cache,
             v_cache,
-            o_full.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
             self.forward_metadata.attn_logits,
@@ -542,17 +454,19 @@ class MixedTritonAttnBackend(AttentionBackend):
         )
 
         # streaming attention
-        self.decode_attention_fwd(
+        self.streaming_decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k_cache,
             v_cache,
             o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.forward_metadata.window_kv_indptr,
-            self.forward_metadata.window_kv_indices,
-            self.forward_metadata.attn_logits,
-            self.forward_metadata.attn_lse,
+            self.forward_metadata.kv_indptr,
+            self.forward_metadata.kv_indices,
+            self.forward_metadata.attn_logits.zero_(),
+            self.forward_metadata.attn_lse.zero_(),
             self.forward_metadata.num_kv_splits,
             self.max_kv_splits,
+            self.sink_window_size,
+            self.recent_window_size,
             layer.scaling,
             layer.logit_cap,
         )
@@ -562,17 +476,10 @@ class MixedTritonAttnBackend(AttentionBackend):
         alpha_weight = layer.alpha_weight.repeat_interleave(self.num_kv_groups).view(
             1, -1, 1
         )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
-
-        # Reshape o_full and o_streaming for element-wise multiplication with alpha_weight
-        o_full_reshaped = o_full.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-        o_streaming_reshaped = o_streaming.view(
-            -1, layer.tp_q_head_num, layer.v_head_dim
-        )
-
+        o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         # Perform the weighted sum and flatten back
-        output = (
-            alpha_weight * o_full_reshaped + (1.0 - alpha_weight) * o_streaming_reshaped
-        )
+        output = alpha_weight * o + (1.0 - alpha_weight) * o_streaming
         return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
@@ -626,76 +533,3 @@ def get_num_kv_splits_triton(
     mask_token = offs_token < num_seq * num_group
     for i in range(0, num_group):
         tl.store(num_kv_splits_ptr + i + offs_token, num_kv_splits, mask=mask_token)
-
-
-def update_streaming_window_buffer(
-    window_kv_indptr,
-    req_to_token,
-    sink_window_size,
-    recent_window_size,
-    seq_lens,
-    req_pool_indices,
-    bs,
-    device,
-):
-    # if seq_len <= sink + recent, then window_len is seq_len
-    # otherwise, it is sink + recent
-    window_kv_lens = torch.minimum(
-        seq_lens,
-        torch.tensor(
-            sink_window_size + recent_window_size, dtype=torch.long, device=device
-        ),
-    )
-
-    window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
-    window_kv_indptr = window_kv_indptr[: bs + 1]
-    window_kv_indices = torch.empty(
-        window_kv_indptr[-1], dtype=torch.int32, device=device
-    )
-
-    create_streaming_window_kv_indices_triton[(bs,)](
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        window_kv_indptr,
-        window_kv_indices,
-        sink_window_size,
-        recent_window_size,
-        req_to_token.stride(0),
-    )
-    return window_kv_indptr, window_kv_indices, window_kv_lens
-
-
-def update_streaming_window_buffer_cuda_graph(
-    window_kv_indptr,
-    window_kv_indices,
-    req_to_token,
-    sink_window_size,
-    recent_window_size,
-    seq_lens,
-    req_pool_indices,
-    bs,
-):
-    window_kv_lens = torch.minimum(
-        seq_lens,
-        torch.tensor(
-            sink_window_size + recent_window_size,
-            dtype=torch.long,
-            device=window_kv_indptr.device,
-        ),
-    )
-
-    window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
-    window_kv_indptr = window_kv_indptr[: bs + 1]
-
-    create_streaming_window_kv_indices_triton[(bs,)](
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        window_kv_indptr,
-        window_kv_indices,
-        sink_window_size,
-        recent_window_size,
-        req_to_token.stride(0),
-    )
-    return window_kv_indptr, window_kv_lens

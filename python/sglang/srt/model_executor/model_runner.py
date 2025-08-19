@@ -728,6 +728,9 @@ class ModelRunner:
 
         if self.server_args.enable_mixed_attention:
             self.load_config.load_format = "mixed"
+            self.load_config.model_loader_extra_config["path"] = (
+                self.server_args.adapter_load_path
+            )
 
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm

@@ -1,7 +1,7 @@
 """
 Usage:
-python3 -m unittest test_mixed_triton_attention_backend.TestMixedTritonAttnBackend.test_mmlu_with_full
-python3 -m unittest test_mixed_triton_attention_backend.TestMixedTritonAttnBackend.test_mmlu_with_adapter
+python3 -m unittest test_mixed_flash_attention_backend.TestMixedFlashAttnBackend.test_mmlu_with_full
+python3 -m unittest test_mixed_flash_attention_backend.TestMixedFlashAttnBackend.test_mmlu_with_adapter
 """
 
 import os
@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.mixed_native_backend import MixedNativeAttnBackend
+from sglang.srt.layers.attention.mixed_flash_backend import MixedFlashAttnBackend
 from sglang.srt.layers.attention.mixed_triton_backend import MixedTritonAttnBackend
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -103,11 +103,11 @@ class MockModelRunner:
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
-class TestMixedTritonAttnWithFullAttn(CustomTestCase):
+class TestMixedFlashAttnWithFullAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls._patcher = mock.patch(
-            "sglang.srt.layers.attention.mixed_triton_backend.get_attention_tp_size",
+            "sglang.srt.layers.attention.mixed_flash_backend.get_attention_tp_size",
             return_value=1,
         )
         cls.mock_tp_size = cls._patcher.start()
@@ -130,7 +130,7 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
         )
-        self.backend = MixedTritonAttnBackend(self.model_runner)
+        self.backend = MixedFlashAttnBackend(self.model_runner)
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
 
     def _mock_write_to_req_to_token_pool(self, batch_size, seq_len):
@@ -374,20 +374,20 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
         self._run_attention_test(
             ForwardMode.EXTEND, q_len=extend_len, prefix_len=prefix_len
         )
-        # ! can't pass
+        # ! can pass this one
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
-class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
+class TestMixedFlashAttnWithMixedAttn(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls._patcher = mock.patch(
-            "sglang.srt.layers.attention.mixed_triton_backend.get_attention_tp_size",
+            "sglang.srt.layers.attention.mixed_flash_backend.get_attention_tp_size",
             return_value=1,
         )
         cls.mock_tp_size = cls._patcher.start()
         cls._patcher1 = mock.patch(
-            "sglang.srt.layers.attention.mixed_native_backend.get_attention_tp_size",
+            "sglang.srt.layers.attention.mixed_triton_backend.get_attention_tp_size",
             return_value=1,
         )
         cls.mock_tp_size1 = cls._patcher1.start()
@@ -398,7 +398,7 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
         cls._patcher1.stop()
 
     def setUp(self):
-        torch.manual_seed(42)
+        # torch.manual_seed(42)
         # Test parameters
         self.batch_size = 2
         self.seq_len = 512
@@ -416,8 +416,8 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
             num_heads=self.num_heads,
             head_dim=self.head_dim,
         )
-        self.backend = MixedTritonAttnBackend(self.model_runner)
-        self.ref_backend = MixedNativeAttnBackend(self.ref_model_runner)
+        self.backend = MixedFlashAttnBackend(self.model_runner)
+        self.ref_backend = MixedTritonAttnBackend(self.ref_model_runner)
 
     def _mock_write_to_req_to_token_pool(self, batch_size, seq_len):
         # if page_size > 1, the token pool stores the index to the page.
@@ -665,7 +665,7 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
         self.backend.init_forward_metadata(forward_batch)
         self.ref_backend.init_forward_metadata(forward_batch_ref)
 
-        output_triton_decode = self.backend.forward_decode(
+        output_flash_decode = self.backend.forward_decode(
             q_decode, k_decode, v_decode, layer, forward_batch
         )
 
@@ -673,23 +673,23 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
             q_decode, k_decode, v_decode, layer, forward_batch_ref
         )
 
-        expected_shape = (
+        except_shape = (
             self.batch_size,
             self.num_heads * self.head_dim,
         )
 
-        output_native_decode = output_native_decode.view(expected_shape)
+        output_native_decode = output_native_decode.view(except_shape)
 
-        self._verify_output(output_triton_decode, expected_shape, output_native_decode)
+        self._verify_output(output_flash_decode, except_shape, output_native_decode)
 
 
-class TestMixedTritonAttnBackend(CustomTestCase):
+class TestMixedFlashAttnBackend(CustomTestCase):
     def test_latency(self):
         output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
             [
                 "--attention-backend",
-                "triton",
+                "fa3",
                 "--enable-torch-compile",
                 "--cuda-graph-max-bs",
                 4,
@@ -715,7 +715,7 @@ class TestMixedTritonAttnBackend(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--attention-backend",
-                "triton",
+                "fa3",
                 "--enable-mixed-attention",
                 "--sink-window-size",
                 128,
@@ -755,7 +755,7 @@ class TestMixedTritonAttnBackend(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--attention-backend",
-                "triton",
+                "fa3",
                 "--enable-mixed-attention",
                 "--sink-window-size",
                 128,

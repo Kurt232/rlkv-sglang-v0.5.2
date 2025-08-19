@@ -327,9 +327,10 @@ class ServerArgs:
     offload_mode: str = "cpu"
 
     # Mixed attention
-    enable_mixed_attention: bool = True
+    enable_mixed_attention: bool = False
     sink_window_size: int = 16
     recent_window_size: int = 32
+    adapter_load_path: Optional[str] = None
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -1894,6 +1895,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.recent_window_size,
             help="The recent window size for mixed attention.",
+        )
+        parser.add_argument(
+            "--adapter-load-path",
+            type=str,
+            default=ServerArgs.adapter_load_path,
+            help="The path to the adapter weights for mixed attention. ",
         )
 
         # Optimization/debug options
