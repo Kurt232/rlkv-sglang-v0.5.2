@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+import types
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1525,74 +1526,6 @@ class RemoteModelLoader(BaseModelLoader):
         return model.eval()
 
 
-class MixedModelLoader(DefaultModelLoader):
-    def __init__(self, load_config: LoadConfig):
-        load_config.load_format = LoadFormat.AUTO
-        self.adapter_weight = None
-        adapter_load_path = load_config.model_loader_extra_config.pop("path")
-        if adapter_load_path is not None:
-            if os.path.exists(adapter_load_path):
-                logger.info("Loading adapter weights from %s", adapter_load_path)
-                self.adapter_weight = torch.load(adapter_load_path, map_location="cpu")
-            else:
-                raise ValueError(
-                    f"Adapter weights path {adapter_load_path} does not exist."
-                )
-        super().__init__(load_config)
-
-    def load_model(
-        self,
-        *,
-        model_config: ModelConfig,
-        device_config: DeviceConfig,
-    ) -> nn.Module:
-        logger.info("Loading model with MixedModelLoader")
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
-
-        dtype = next(model.parameters()).dtype
-        for layer_id, layer in enumerate(model.model.layers):
-            module = layer.self_attn.attn  # RadixAttention
-            module.register_parameter(
-                "alpha_weight",
-                nn.Parameter(
-                    torch.ones(
-                        layer.self_attn.total_num_kv_heads,
-                        device=target_device,
-                        dtype=dtype,
-                    )
-                ),
-            )
-            if self.adapter_weight is not None:
-                try:
-                    with torch.no_grad():
-                        loaded = self.adapter_weight[layer_id].to(
-                            device=target_device, dtype=dtype
-                        )
-                        if loaded.shape != module.alpha_weight.shape:
-                            raise RuntimeError(
-                                f"Shape mismatch for layer {layer_id}: "
-                                f"expected {module.alpha_weight.shape}, "
-                                f"got {loaded.shape}"
-                            )
-                        module.alpha_weight.copy_(loaded)
-                except KeyError:
-                    logger.warning(
-                        f"Alpha weights for layer {layer_id} not found in the adapter weights."
-                    )
-
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
-
-        return model.eval()
-
-
 def load_model_with_cpu_quantization(
     self,
     *,
@@ -1648,8 +1581,5 @@ def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:
 
     if load_config.load_format == LoadFormat.REMOTE:
         return RemoteModelLoader(load_config)
-
-    if load_config.load_format == LoadFormat.MIXED:
-        return MixedModelLoader(load_config)
 
     return DefaultModelLoader(load_config)

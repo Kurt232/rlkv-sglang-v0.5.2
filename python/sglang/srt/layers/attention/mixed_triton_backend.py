@@ -370,6 +370,7 @@ class MixedTritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        adapter: Optional[torch.Tensor] = None,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -414,6 +415,7 @@ class MixedTritonAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        adapter: Optional[torch.Tensor] = None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -471,15 +473,18 @@ class MixedTritonAttnBackend(AttentionBackend):
             layer.logit_cap,
         )
 
-        # layer.alpha_weight: originally [num_total_kv_heads];
+        # layer.adapter: originally [num_total_kv_heads];
         # after TP slicing, current rank sees [num_kv_heads]
-        alpha_weight = layer.alpha_weight.repeat_interleave(self.num_kv_groups).view(
+        adapter = adapter.repeat_interleave(self.num_kv_groups).view(
             1, -1, 1
         )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
         o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         # Perform the weighted sum and flatten back
-        output = alpha_weight * o + (1.0 - alpha_weight) * o_streaming
+        assert (
+            adapter.shape[1] == layer.tp_q_head_num
+        ), f"{adapter.shape=} != {layer.tp_q_head_num=}"
+        output = adapter * o + (1.0 - adapter) * o_streaming
         return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 

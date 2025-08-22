@@ -23,7 +23,6 @@ class LoadFormat(str, enum.Enum):
     LAYERED = "layered"
     JAX = "jax"
     REMOTE = "remote"
-    MIXED = "mixed"
 
 
 @dataclass

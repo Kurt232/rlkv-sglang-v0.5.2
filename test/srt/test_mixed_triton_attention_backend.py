@@ -164,16 +164,6 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
             torch.randn(shape, dtype=self.dtype, device=self.device),
         )
 
-    def _run_reference_forward(
-        self, mode, q, k, v, layer, forward_batch, expected_shape
-    ):
-        """Run reference forward pass using native backend."""
-        if mode == ForwardMode.EXTEND:
-            output = self.ref_backend.forward_extend(q, k, v, layer, forward_batch)
-        else:  # ForwardMode.DECODE
-            output = self.ref_backend.forward_decode(q, k, v, layer, forward_batch)
-        return output.view(expected_shape)
-
     def _verify_output(self, output, expected_shape, output_ref):
         """Verify output tensor shape, dtype, and values."""
         self.assertEqual(
@@ -315,7 +305,7 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
             prefix_len: Length of the prefix sequence for extend mode
         """
         layer = self._create_attention_layer()
-        layer.alpha_weight = nn.Parameter(
+        adapter = nn.Parameter(
             torch.ones(
                 self.num_heads,
                 device=self.device,
@@ -347,13 +337,18 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
                 self.num_heads * self.head_dim,
             )
             output = self.backend.forward_extend(q, k, v, layer, forward_batch)
+            output_ref = self.ref_backend.forward_extend(q, k, v, layer, forward_batch)
         else:
             expected_shape = (self.batch_size, self.num_heads * self.head_dim)
-            output = self.backend.forward_decode(q, k, v, layer, forward_batch)
+            output = self.backend.forward_decode(
+                q, k, v, layer, forward_batch, adapter=adapter
+            )
+            output_ref = self.ref_backend.forward_decode(
+                q, k, v, layer, forward_batch, adapter=adapter
+            )
 
-        output_ref = self._run_reference_forward(
-            mode, q, k, v, layer, forward_batch, expected_shape
-        )
+        # Reshape the output_ref to match the expected shape
+        output_ref = output_ref.view(expected_shape)
 
         self._verify_output(output, expected_shape, output_ref)
 
@@ -640,8 +635,8 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
 
         layer = self._create_attention_layer()
 
-        # Set alpha_weight to 0.5 for mixed attention
-        layer.alpha_weight = nn.Parameter(
+        # Set adapter to 0.5 for mixed attention
+        adapter = nn.Parameter(
             torch.ones(
                 self.num_heads,
                 device=self.device,
@@ -666,11 +661,11 @@ class TestMixedTritonAttnWithMixedAttn(CustomTestCase):
         self.ref_backend.init_forward_metadata(forward_batch_ref)
 
         output_triton_decode = self.backend.forward_decode(
-            q_decode, k_decode, v_decode, layer, forward_batch
+            q_decode, k_decode, v_decode, layer, forward_batch, adapter=adapter
         )
 
         output_native_decode = self.ref_backend.forward_decode(
-            q_decode, k_decode, v_decode, layer, forward_batch_ref
+            q_decode, k_decode, v_decode, layer, forward_batch_ref, adapter=adapter
         )
 
         expected_shape = (

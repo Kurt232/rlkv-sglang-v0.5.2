@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -249,9 +249,11 @@ class MixedNativeAttnBackend(AttentionBackend):
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             # streaming attention mask
-            mask = torch.zeros((1, seq_len_kv), dtype=torch.bool, device=per_req_query.device)
+            mask = torch.zeros(
+                (1, seq_len_kv), dtype=torch.bool, device=per_req_query.device
+            )
             if seq_len_kv > self.sink_window_size + self.recent_window_size:
-                mask[:, self.sink_window_size:-self.recent_window_size] = True
+                mask[:, self.sink_window_size : -self.recent_window_size] = True
             mask = mask
             per_req_out = (
                 scaled_dot_product_attention(
@@ -324,6 +326,7 @@ class MixedNativeAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        adapter: Optional[torch.Tensor] = None,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -375,14 +378,14 @@ class MixedNativeAttnBackend(AttentionBackend):
             causal=True,
         )
 
-        # layer.alpha_weight: originally [num_total_kv_heads];
+        # layer.adapter: originally [num_total_kv_heads];
         # after TP slicing, current rank sees [num_kv_heads]
-        alpha_weight = layer.alpha_weight.repeat_interleave(self.num_kv_groups).view(
+        adapter = adapter.repeat_interleave(self.num_kv_groups).view(
             1, -1, 1
         )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
 
         # Perform the weighted sum and flatten back
-        output = alpha_weight * o_full_ + (1.0 - alpha_weight) * o_streaming_
+        output = adapter * o_full_ + (1.0 - adapter) * o_streaming_
         # return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return output
 

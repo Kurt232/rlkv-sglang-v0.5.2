@@ -135,6 +135,7 @@ class MixedFlashAttnBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        adapter: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -194,6 +195,7 @@ class MixedFlashAttnBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        adapter: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -257,11 +259,9 @@ class MixedFlashAttnBackend(AttentionBackend):
             streaming_info=metadata.streaming_mask,
         )
 
-        alpha_weight = layer.alpha_weight.repeat_interleave(self.num_kv_groups).view(
-            1, -1, 1
-        )
+        adapter = adapter.repeat_interleave(self.num_kv_groups).view(1, -1, 1)
 
-        o = o * alpha_weight + o_streaming * (1.0 - alpha_weight)
+        o = o * adapter + o_streaming * (1.0 - adapter)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

@@ -20,12 +20,15 @@ import json
 import logging
 import os
 import time
+import types
+
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Shard
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -361,6 +364,68 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+
+        # enable mixed_attention forward
+        # add by Wenjie
+        if self.server_args.enable_mixed_attention:
+            adapter_weight = None
+            adapter_load_path = self.server_args.adapter_load_path
+            if adapter_load_path is not None:
+                if os.path.exists(adapter_load_path):
+                    logger.info("Loading adapter weights from %s", adapter_load_path)
+                    # Load the complete weights on CPU first
+                    adapter_weight = torch.load(adapter_load_path, map_location="cpu")
+                else:
+                    raise ValueError(
+                        f"Adapter weights path {adapter_load_path} does not exist."
+                    )
+
+            # monkey patch the forward method of each attention layer
+            def _forward(
+                self,
+                positions: torch.Tensor,
+                hidden_states: torch.Tensor,
+                forward_batch,
+            ) -> torch.Tensor:
+                qkv, _ = self.qkv_proj(hidden_states)
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.rotary_emb(positions, q, k)
+                attn_output = self.attn(
+                    q, k, v, forward_batch, save_kv_cache=True, adapter=self.adapter
+                )
+                output, _ = self.o_proj(attn_output)
+                return output
+
+            for layer_id, layer in enumerate(self.model.model.layers):
+                module = layer.self_attn
+                module.forward = types.MethodType(_forward, module)
+
+                adapter_param = None
+                if adapter_weight is None:
+                    adapter_param = torch.ones(
+                        module.num_kv_heads, device=self.device, dtype=self.dtype
+                    )
+                else:
+                    try:
+                        # Load the full, unsharded weight for the current layer from the CPU dictionary
+                        full_weight = adapter_weight[layer_id]
+
+                        local_shard_weight = (
+                            full_weight[  # ! I am not sure about how DP PP work in here
+                                self.tp_rank : self.tp_rank + 1
+                            ]
+                        )
+                        # Distribute the tensor across the TP group, creating a DTensor
+                        adapter_param = local_shard_weight.clone().to(self.device)
+                    except KeyError:
+                        raise ValueError(
+                            f"Adapter weights for layer {layer_id} not found in the provided path: {adapter_load_path}"
+                        )
+
+                module.register_parameter(
+                    "adapter",
+                    torch.nn.Parameter(adapter_param),
+                )
 
         # Init lora
         if server_args.enable_lora:
@@ -726,12 +791,6 @@ class ModelRunner:
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
 
-        if self.server_args.enable_mixed_attention:
-            self.load_config.load_format = "mixed"
-            self.load_config.model_loader_extra_config["path"] = (
-                self.server_args.adapter_load_path
-            )
-
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -933,6 +992,8 @@ class ModelRunner:
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
+
+        # logger.warning(f"update_weights_from_distributed: {names}")
 
         try:
             weights = []
@@ -1644,6 +1705,7 @@ class ModelRunner:
                     MixedTritonAttnBackend,
                 )
 
+                logger.warning("MixedTritonAttnBackend")
                 return MixedTritonAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
@@ -1660,6 +1722,13 @@ class ModelRunner:
 
             return FlashMLABackend(self)
         elif backend_str == "fa3":
+            if self.server_args.enable_mixed_attention:
+                from sglang.srt.layers.attention.mixed_flash_backend import (
+                    MixedFlashAttnBackend,
+                )
+
+                logger.warning("MixedFlashAttnBackend")
+                return MixedFlashAttnBackend(self)
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
             ) or torch.cuda.get_device_capability()[0] == 9, (
