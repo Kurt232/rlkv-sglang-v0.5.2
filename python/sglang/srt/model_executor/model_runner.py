@@ -412,7 +412,9 @@ class ModelRunner:
 
                         local_shard_weight = (
                             full_weight[  # ! I am not sure about how DP PP work in here
-                                self.tp_rank : self.tp_rank + 1
+                                self.tp_rank
+                                * module.num_kv_heads : (self.tp_rank + 1)
+                                * module.num_kv_heads
                             ]
                         )
                         # Distribute the tensor across the TP group, creating a DTensor
