@@ -402,8 +402,11 @@ class ModelRunner:
 
                 adapter_param = None
                 if adapter_weight is None:
-                    adapter_param = torch.ones(
-                        module.num_kv_heads, device=self.device, dtype=self.dtype
+                    adapter_param = (
+                        torch.ones(
+                            module.num_kv_heads, device=self.device, dtype=self.dtype
+                        )
+                        * self.server_args.adapter_init_value
                     )
                 else:
                     try:

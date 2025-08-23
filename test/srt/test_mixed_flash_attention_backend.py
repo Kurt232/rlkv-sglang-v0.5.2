@@ -98,6 +98,7 @@ class MockModelRunner:
             enable_mixed_attention=True,
             sink_window_size=sink_window_size,
             recent_window_size=recent_window_size,
+            adapter_init_value=1.0,
         )
         self.kv_cache_dtype = self.dtype
 

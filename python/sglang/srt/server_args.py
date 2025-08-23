@@ -331,6 +331,7 @@ class ServerArgs:
     sink_window_size: int = 16
     recent_window_size: int = 32
     adapter_load_path: Optional[str] = None
+    adapter_init_value: float = 1.0
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -1901,6 +1902,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.adapter_load_path,
             help="The path to the adapter weights for mixed attention. ",
+        )
+        parser.add_argument(
+            "--adapter-init-value",
+            type=float,
+            default=ServerArgs.adapter_init_value,
+            help="Initial value for the adapter weights in mixed attention.",
         )
 
         # Optimization/debug options
