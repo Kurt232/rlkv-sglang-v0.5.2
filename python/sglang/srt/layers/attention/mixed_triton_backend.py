@@ -29,8 +29,6 @@ class ForwardMetadata:
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
     qo_indptr: torch.Tensor
-    custom_mask: torch.Tensor
-    mask_indptr: torch.Tensor
 
 
 class MixedTritonAttnBackend(AttentionBackend):
@@ -50,6 +48,9 @@ class MixedTritonAttnBackend(AttentionBackend):
         from sglang.srt.layers.attention.triton_ops.streaming_decode_attention import (
             streaming_decode_attention_fwd,
         )
+        from sglang.srt.layers.attention.triton_ops.streaming_extend_attention import (
+            streaming_extend_attention_fwd,
+        )
 
         super().__init__()
 
@@ -58,6 +59,9 @@ class MixedTritonAttnBackend(AttentionBackend):
             streaming_decode_attention_fwd
         )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.streaming_extend_attention_fwd = torch.compiler.disable(
+            streaming_extend_attention_fwd
+        )
 
         self.skip_prefill = skip_prefill
 
@@ -82,10 +86,6 @@ class MixedTritonAttnBackend(AttentionBackend):
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
-            )
-
-            self.mask_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
         self.num_head = (
@@ -180,8 +180,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
             qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
             max_extend_len = None
 
         else:
@@ -207,8 +205,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
-            mask_indptr = None
             attn_logits = None
             attn_lse = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
@@ -222,8 +218,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             kv_indptr,
             kv_indices,
             qo_indptr,
-            custom_mask,
-            mask_indptr,
         )
 
     def init_cuda_graph_state(
@@ -253,13 +247,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
-
-        if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device=self.device,
-            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -297,8 +284,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
             qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
 
         else:
             raise ValueError(
@@ -313,8 +298,6 @@ class MixedTritonAttnBackend(AttentionBackend):
             kv_indptr,
             kv_indices,
             qo_indptr,
-            custom_mask,
-            mask_indptr,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -375,8 +358,12 @@ class MixedTritonAttnBackend(AttentionBackend):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o_streaming = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
         else:
             o = torch.empty_like(q)
+            o_streaming = torch.empty_like(q)
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -397,15 +384,44 @@ class MixedTritonAttnBackend(AttentionBackend):
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            None,
             True,
-            self.forward_metadata.mask_indptr,
+            None,
             self.forward_metadata.max_extend_len,
             layer.scaling,
             layer.logit_cap,
             sliding_window_size,
         )
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        # streaming attention
+        self.streaming_extend_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.forward_metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            True,
+            self.forward_metadata.max_extend_len,
+            self.sink_window_size,
+            self.recent_window_size,
+            layer.scaling,
+            layer.logit_cap,
+        )
+
+        # layer.adapter: originally [num_total_kv_heads];
+        # after TP slicing, current rank sees [num_kv_heads]
+        adapter = adapter.repeat_interleave(self.num_kv_groups).view(
+            1, -1, 1
+        )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
+        o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        output = adapter * o + (1.0 - adapter) * o_streaming
+        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -480,10 +496,7 @@ class MixedTritonAttnBackend(AttentionBackend):
         )  # [num_kv_head] -> [1, num_kv_head * kv_group, 1]
         o = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-        # Perform the weighted sum and flatten back
-        assert (
-            adapter.shape[1] == layer.tp_q_head_num
-        ), f"{adapter.shape=} != {layer.tp_q_head_num=}"
+
         output = adapter * o + (1.0 - adapter) * o_streaming
         return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

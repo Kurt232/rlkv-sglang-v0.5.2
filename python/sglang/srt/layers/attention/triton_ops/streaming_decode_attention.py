@@ -52,8 +52,6 @@ def _fwd_kernel_stage1(
     Att_Out,
     Att_Lse,
     num_kv_splits,
-    sink_win_size,
-    local_win_size,
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -71,6 +69,8 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    SINK_WIN_SIZE: tl.constexpr,
+    LOCAL_WIN_SIZE: tl.constexpr,
 ):
     """
     streaming attn
@@ -98,62 +98,63 @@ def _fwd_kernel_stage1(
     )
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    local_win_start = tl.maximum(cur_batch_seq_len - local_win_size, 0)
+    local_win_start = tl.maximum(cur_batch_seq_len - LOCAL_WIN_SIZE, 0)
 
     e_max = -float("inf")
     e_sum = 0.0
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    if (
-        split_kv_end > split_kv_start
-        and split_kv_end <= sink_win_size
-        or local_win_start <= split_kv_start
-    ):
+    if split_kv_end > split_kv_start:
         q = tl.load(Q + off_q, mask=mask_d, other=0.0)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
-                other=0,
-            )
-            offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                other=0.0,
-            )
-            qk = tl.sum(q[None, :] * k, 1)
-            qk *= sm_scale
 
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+            # streaming mask
+            if start_n < SINK_WIN_SIZE or local_win_start < start_n + BLOCK_N:
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+                offs_buf_k = (
+                    kv_loc[:, None] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[None, :]
+                )
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=0.0,
+                )
+                qk = tl.sum(q[None, :] * k, 1)
+                qk *= sm_scale
 
-            qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+                qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            n_e_max = tl.maximum(tl.max(qk, 0), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max)
-            acc *= re_scale
-            acc += tl.sum(p[:, None] * v, 0)
+                offs_buf_v = (
+                    kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
 
-            e_sum = e_sum * re_scale + tl.sum(p, 0)
-            e_max = n_e_max
+                n_e_max = tl.maximum(tl.max(qk, 0), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max)
+                acc *= re_scale
+                acc += tl.sum(p[:, None] * v, 0)
+
+                e_sum = e_sum * re_scale + tl.sum(p, 0)
+                e_max = n_e_max
+
+        e_sum = tl.maximum(e_sum, 1e-10)
 
         offs_mid_o = (
             cur_batch * stride_mid_ob
@@ -228,8 +229,6 @@ def _decode_att_m_fwd(
         att_out,
         att_lse,
         num_kv_splits,
-        sink_win_size,
-        local_win_size,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
@@ -249,6 +248,8 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        SINK_WIN_SIZE=sink_win_size,
+        LOCAL_WIN_SIZE=local_win_size,
     )
 
 
@@ -263,8 +264,6 @@ def _fwd_grouped_kernel_stage1(
     Att_Out,
     Att_Lse,
     num_kv_splits,
-    sink_win_size,
-    local_win_size,
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
@@ -285,6 +284,8 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    SINK_WIN_SIZE: tl.constexpr,
+    LOCAL_WIN_SIZE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -322,17 +323,13 @@ def _fwd_grouped_kernel_stage1(
     )
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
-    local_win_start = tl.maximum(cur_batch_seq_len - local_win_size, 0)
+    local_win_start = tl.maximum(cur_batch_seq_len - LOCAL_WIN_SIZE, 0)
 
-    e_max = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    if (
-        split_kv_end > split_kv_start
-        and split_kv_end <= sink_win_size
-        or local_win_start <= split_kv_start
-    ):
+    if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
         if BLOCK_DPE > 0:
             qpe = tl.load(
@@ -340,62 +337,69 @@ def _fwd_grouped_kernel_stage1(
             )
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            kv_loc = tl.load(
-                kv_indices + cur_batch_kv_start_idx + offs_n,
-                mask=offs_n < split_kv_end,
-                other=0,
-            )
-            offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
-                other=0.0,
-            )
-            qk = tl.dot(q, k.to(q.dtype))
-            if BLOCK_DPE > 0:
-                offs_buf_kpe = (
+
+            # streaming mask
+            if start_n < SINK_WIN_SIZE or local_win_start < start_n + BLOCK_N:
+                kv_loc = tl.load(
+                    kv_indices + cur_batch_kv_start_idx + offs_n,
+                    mask=offs_n < split_kv_end,
+                    other=0,
+                )
+                offs_buf_k = (
                     kv_loc[None, :] * stride_buf_kbs
                     + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
+                    + offs_d[:, None]
                 )
-                kpe = tl.load(
-                    K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe.to(qpe.dtype))
-            qk *= sm_scale
+                qk = tl.dot(q, k.to(q.dtype))
+                if BLOCK_DPE > 0:
+                    offs_buf_kpe = (
+                        kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
+                    kpe = tl.load(
+                        K_Buffer + offs_buf_kpe,
+                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                        other=0.0,
+                    )
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
+                qk *= sm_scale
 
-            if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                if logit_cap > 0:
+                    qk = logit_cap * tanh(qk / logit_cap)
 
-            qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            )
+                qk = tl.where(
+                    mask_h[:, None] & (offs_n[None, :] < split_kv_end),
+                    qk,
+                    float("-inf"),
+                )
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+                offs_buf_v = (
+                    kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
 
-            n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+                n_e_max = tl.maximum(tl.max(qk, 1), e_max)
+                re_scale = tl.exp(e_max - n_e_max)
+                p = tl.exp(qk - n_e_max[:, None])
+                acc *= re_scale[:, None]
+                acc += tl.dot(p.to(v.dtype), v)
 
-            e_sum = e_sum * re_scale + tl.sum(p, 1)
-            e_max = n_e_max
+                e_sum = e_sum * re_scale + tl.sum(p, 1)
+                e_max = n_e_max
+
+        e_sum = tl.maximum(e_sum, 1e-10)
 
         offs_mid_o = (
             cur_batch * stride_mid_ob
@@ -486,8 +490,6 @@ def _decode_grouped_att_m_fwd(
         att_out,
         att_lse,
         num_kv_splits,
-        sink_win_size,
-        local_win_size,
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
@@ -510,6 +512,8 @@ def _decode_grouped_att_m_fwd(
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
+        SINK_WIN_SIZE=sink_win_size,
+        LOCAL_WIN_SIZE=local_win_size,
         **extra_kargs,
     )
 
@@ -730,12 +734,9 @@ def streaming_decode_attention_fwd(
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
-    sink_win_size = (
-        (sink_win_size + _MIN_BLOCK_KV - 1) // _MIN_BLOCK_KV
-    ) * _MIN_BLOCK_KV
-    local_win_size = (
-        (local_win_size + _MIN_BLOCK_KV - 1) // _MIN_BLOCK_KV
-    ) * _MIN_BLOCK_KV
+    assert (
+        sink_win_size % _MIN_BLOCK_KV == 0 and local_win_size % _MIN_BLOCK_KV == 0
+    ), "sink_win_size and local_win_size must be multiples of BLOCK_N"
     if kv_group_num == 1:
         # MHA
         decode_attention_fwd_normal(

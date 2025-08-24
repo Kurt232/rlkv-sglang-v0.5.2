@@ -337,16 +337,16 @@ class TestMixedTritonAttnWithFullAttn(CustomTestCase):
                 self.batch_size * q_len,
                 self.num_heads * self.head_dim,
             )
-            output = self.backend.forward_extend(q, k, v, layer, forward_batch)
+            output = self.backend.forward_extend(
+                q, k, v, layer, forward_batch, adapter=adapter
+            )
             output_ref = self.ref_backend.forward_extend(q, k, v, layer, forward_batch)
         else:
             expected_shape = (self.batch_size, self.num_heads * self.head_dim)
             output = self.backend.forward_decode(
                 q, k, v, layer, forward_batch, adapter=adapter
             )
-            output_ref = self.ref_backend.forward_decode(
-                q, k, v, layer, forward_batch, adapter=adapter
-            )
+            output_ref = self.ref_backend.forward_decode(q, k, v, layer, forward_batch)
 
         # Reshape the output_ref to match the expected shape
         output_ref = output_ref.view(expected_shape)
