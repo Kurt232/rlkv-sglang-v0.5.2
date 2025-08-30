@@ -421,7 +421,9 @@ class ModelRunner:
                             ]
                         )
                         # Distribute the tensor across the TP group, creating a DTensor
-                        adapter_param = local_shard_weight.clone().to(self.device)
+                        adapter_param = (
+                            local_shard_weight.clone().to(self.device).to(self.dtype)
+                        )
                     except KeyError:
                         raise ValueError(
                             f"Adapter weights for layer {layer_id} not found in the provided path: {adapter_load_path}"
