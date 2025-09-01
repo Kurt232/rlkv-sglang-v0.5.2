@@ -194,7 +194,8 @@ class MixedTritonAttnBackend(AttentionBackend):
                     update_streaming_window_buffer(
                         self.window_kv_indptr,
                         self.req_to_token,
-                        self.sliding_window_size,
+                        self.sink_window_size,
+                        self.local_window_size,
                         forward_batch.seq_lens,
                         forward_batch.req_pool_indices,
                         bs,
@@ -836,6 +837,7 @@ def update_streaming_window_buffer(
     seq_lens,  # [bs]
     req_pool_indices,
     bs,
+    device,
 ):
     block_size = 128
     sink_window_size = (sink_window_size + block_size - 1) // block_size * block_size
@@ -850,7 +852,7 @@ def update_streaming_window_buffer(
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
     window_kv_indices = torch.empty(
-        window_kv_indptr[-1], dtype=torch.int32, device=req_pool_indices.device
+        window_kv_indptr[-1], dtype=torch.int32, device=device
     )
 
     local_window_kv_start_idx = (
