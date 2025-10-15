@@ -381,20 +381,19 @@ class ModelRunner:
                     )
 
             # monkey patch the forward method of each attention layer
-            def _forward(
-                self,
-                positions: torch.Tensor,
-                hidden_states: torch.Tensor,
-                forward_batch,
-            ) -> torch.Tensor:
-                qkv, _ = self.qkv_proj(hidden_states)
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-                q, k = self.rotary_emb(positions, q, k)
-                attn_output = self.attn(
-                    q, k, v, forward_batch, save_kv_cache=True, adapter=self.adapter
+            model_type = self.model_config.hf_config.model_type.lower()
+            if model_type == "qwen3":
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_qwen3_forward as _forward,
                 )
-                output, _ = self.o_proj(attn_output)
-                return output
+            elif model_type in ["llama", "qwen2"]:
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_forward as _forward,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Mixed attention is not supported for the {model_type}"
+                )
 
             for layer_id, layer in enumerate(self.model.model.layers):
                 module = layer.self_attn
