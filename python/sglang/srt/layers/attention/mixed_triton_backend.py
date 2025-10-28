@@ -704,8 +704,7 @@ class MixedTritonAttnBackend(AttentionBackend):
         o = o.view(-1, layer.tp_q_head_num, layer.head_dim)
         o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        adapter = adapter.repeat_interleave(self.num_kv_groups).view(1, -1, 1)
-        o = adapter * o + (1.0 - adapter) * o_streaming
+        o = adapter(o, o_streaming)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -771,8 +770,7 @@ class MixedTritonAttnBackend(AttentionBackend):
         o = o.view(-1, layer.tp_q_head_num, layer.head_dim)
         o_streaming = o_streaming.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        adapter = adapter.repeat_interleave(self.num_kv_groups).view(1, -1, 1)
-        o = adapter * o + (1.0 - adapter) * o_streaming
+        o = adapter(o, o_streaming)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

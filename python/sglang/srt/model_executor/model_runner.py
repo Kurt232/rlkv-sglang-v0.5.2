@@ -21,7 +21,6 @@ import logging
 import os
 import time
 import types
-
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -368,13 +367,18 @@ class ModelRunner:
         # enable mixed_attention forward
         # add by Wenjie
         if self.server_args.enable_mixed_attention:
-            adapter_weight = None
+            from sglang.srt.model_executor.monkey_forward import HeadAdapterLayer
+
+            adapter_weights_dict = None
             adapter_load_path = self.server_args.adapter_load_path
+
             if adapter_load_path is not None:
                 if os.path.exists(adapter_load_path):
                     logger.info("Loading adapter weights from %s", adapter_load_path)
                     # Load the complete weights on CPU first
-                    adapter_weight = torch.load(adapter_load_path, map_location="cpu")
+                    adapter_weights_dict = torch.load(
+                        adapter_load_path, map_location="cpu"
+                    )
                 else:
                     raise ValueError(
                         f"Adapter weights path {adapter_load_path} does not exist."
@@ -395,43 +399,53 @@ class ModelRunner:
                     f"Mixed attention is not supported for the {model_type}"
                 )
 
+            num_total_attention_heads = self.model_config.num_attention_heads
+            num_total_kv_heads = self.model_config.num_key_value_heads
             for layer_id, layer in enumerate(self.model.model.layers):
                 module = layer.self_attn
+
+                # Monkey patch the forward method
                 module.forward = types.MethodType(_forward, module)
 
-                adapter_param = None
-                if adapter_weight is None:
-                    adapter_param = (
-                        torch.ones(
-                            module.num_kv_heads, device=self.device, dtype=self.dtype
-                        )
-                        * self.server_args.adapter_init_value
-                    )
+                # Create Adapter module
+                adapter = HeadAdapterLayer(
+                    num_heads=num_total_attention_heads,
+                    num_kv_heads=num_total_kv_heads,
+                    params_dtype=self.dtype,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                ).to(self.device)
+
+                # Load or initialize adapter weights
+                if adapter_weights_dict is None:
+                    # Initialize with default value
+                    init_value = self.server_args.adapter_init_value
+                    with torch.no_grad():
+                        adapter.weight.fill_(init_value)
                 else:
                     try:
-                        # Load the full, unsharded weight for the current layer from the CPU dictionary
-                        full_weight = adapter_weight[layer_id]
+                        # Load the full, unsharded weight for the current layer
+                        full_weight = adapter_weights_dict[layer_id]
 
-                        local_shard_weight = (
-                            full_weight[  # ! I am not sure about how DP PP work in here
-                                self.tp_rank
-                                * module.num_kv_heads : (self.tp_rank + 1)
-                                * module.num_kv_heads
-                            ]
-                        )
-                        # Distribute the tensor across the TP group, creating a DTensor
-                        adapter_param = (
-                            local_shard_weight.clone().to(self.device).to(self.dtype)
-                        )
+                        # Validate shape
+                        expected_shape = (module.num_kv_heads,)
+                        if full_weight.shape != expected_shape:
+                            raise ValueError(
+                                f"Adapter weight shape mismatch for layer {layer_id}: "
+                                f"expected {expected_shape}, got {full_weight.shape}"
+                            )
+
+                        # Use the weight_loader to handle TP sharding automatically
+                        adapter.weight_loader(adapter.weight, full_weight)
+
                     except KeyError:
                         raise ValueError(
-                            f"Adapter weights for layer {layer_id} not found in the provided path: {adapter_load_path}"
+                            f"Adapter weights for layer {layer_id} not found in "
+                            f"the provided path: {adapter_load_path}"
                         )
 
-                module.register_parameter(
-                    "adapter",
-                    torch.nn.Parameter(adapter_param),
-                )
+                # Register the adapter layer as a submodule
+                module.add_module("adapter", adapter)
 
         # Init lora
         if server_args.enable_lora:
