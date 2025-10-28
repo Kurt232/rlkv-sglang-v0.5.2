@@ -3,10 +3,8 @@ import math
 
 import pytest
 import torch
-from block_sparse_attn import block_sparse_attn_func
 from einops import repeat
 from utils import (
-    MockModelRunner,
     attention_blocksparse_ref,
     convert_flash_attn_S_to_softmax,
     generate_base_sparsity_mask,

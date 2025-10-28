@@ -517,7 +517,8 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.config.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.config.vocab_size]
+            logits = logits.to(dtype=torch.float)
 
         if self.final_logit_softcapping:
             if not _is_npu:

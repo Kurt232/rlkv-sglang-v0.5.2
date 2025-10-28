@@ -3,7 +3,8 @@ import math
 
 import pytest
 import torch
-from block_sparse_attn import block_sparse_attn_func
+
+# from block_sparse_attn import block_sparse_attn_func
 from einops import rearrange, repeat
 from utils import (
     attention_blocksparse_ref,
