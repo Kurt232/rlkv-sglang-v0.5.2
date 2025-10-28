@@ -1742,13 +1742,6 @@ class ModelRunner:
 
             return FlashMLABackend(self)
         elif backend_str == "fa3":
-            if self.server_args.enable_mixed_attention:
-                from sglang.srt.layers.attention.mixed_flash_backend import (
-                    MixedFlashAttnBackend,
-                )
-
-                logger.warning("MixedFlashAttnBackend")
-                return MixedFlashAttnBackend(self)
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
             ) or torch.cuda.get_device_capability()[0] == 9, (
