@@ -20,12 +20,14 @@ import json
 import logging
 import os
 import time
+import types
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Shard
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -361,6 +363,89 @@ class ModelRunner:
         supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
         if self.tp_size > 1 and supports_torch_tp:
             self.apply_torch_tp()
+
+        # enable mixed_attention forward
+        # add by Wenjie
+        if self.server_args.enable_mixed_attention:
+            from sglang.srt.model_executor.monkey_forward import HeadAdapterLayer
+
+            adapter_weights_dict = None
+            adapter_load_path = self.server_args.adapter_load_path
+
+            if adapter_load_path is not None:
+                if os.path.exists(adapter_load_path):
+                    logger.info("Loading adapter weights from %s", adapter_load_path)
+                    # Load the complete weights on CPU first
+                    adapter_weights_dict = torch.load(
+                        adapter_load_path, map_location="cpu"
+                    )
+                else:
+                    raise ValueError(
+                        f"Adapter weights path {adapter_load_path} does not exist."
+                    )
+
+            # monkey patch the forward method of each attention layer
+            model_type = self.model_config.hf_config.model_type.lower()
+            if model_type == "qwen3":
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_qwen3_forward as _forward,
+                )
+            elif model_type in ["llama", "qwen2"]:
+                from sglang.srt.model_executor.monkey_forward import (
+                    monkey_forward as _forward,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Mixed attention is not supported for the {model_type}"
+                )
+
+            num_total_attention_heads = self.model_config.num_attention_heads
+            num_total_kv_heads = self.model_config.num_key_value_heads
+            for layer_id, layer in enumerate(self.model.model.layers):
+                module = layer.self_attn
+
+                # Monkey patch the forward method
+                module.forward = types.MethodType(_forward, module)
+
+                # Create Adapter module
+                adapter = HeadAdapterLayer(
+                    num_heads=num_total_attention_heads,
+                    num_kv_heads=num_total_kv_heads,
+                    params_dtype=self.dtype,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                ).to(self.device)
+
+                # Load or initialize adapter weights
+                if adapter_weights_dict is None:
+                    # Initialize with default value
+                    init_value = self.server_args.adapter_init_value
+                    with torch.no_grad():
+                        adapter.weight.fill_(init_value)
+                else:
+                    try:
+                        # Load the full, unsharded weight for the current layer
+                        full_weight = adapter_weights_dict[layer_id]
+
+                        # Validate shape
+                        expected_shape = (module.num_kv_heads,)
+                        if full_weight.shape != expected_shape:
+                            raise ValueError(
+                                f"Adapter weight shape mismatch for layer {layer_id}: "
+                                f"expected {expected_shape}, got {full_weight.shape}"
+                            )
+
+                        # Use the weight_loader to handle TP sharding automatically
+                        adapter.weight_loader(adapter.weight, full_weight)
+
+                    except KeyError:
+                        raise ValueError(
+                            f"Adapter weights for layer {layer_id} not found in "
+                            f"the provided path: {adapter_load_path}"
+                        )
+
+                # Register the adapter layer as a submodule
+                module.add_module("adapter", adapter)
 
         # Init lora
         if server_args.enable_lora:
@@ -927,6 +1012,8 @@ class ModelRunner:
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
         )
+
+        # logger.warning(f"update_weights_from_distributed: {names}")
 
         try:
             weights = []
@@ -1633,6 +1720,13 @@ class ModelRunner:
                 )
 
                 return DoubleSparseAttnBackend(self)
+            elif self.server_args.enable_mixed_attention:
+                from sglang.srt.layers.attention.mixed_triton_backend import (
+                    MixedTritonAttnBackend,
+                )
+
+                logger.warning("MixedTritonAttnBackend")
+                return MixedTritonAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

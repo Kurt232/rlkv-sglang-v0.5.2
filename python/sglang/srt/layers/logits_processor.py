@@ -328,7 +328,7 @@ class LogitsProcessor(nn.Module):
         logits = self._get_logits(pruned_states, lm_head, logits_metadata)
         sampled_logits = (
             logits[sample_indices] if sample_indices is not None else logits
-        )
+        ).to(dtype=torch.float32)
 
         if self.debug_tensor_dump_output_folder:
             assert (
@@ -372,8 +372,9 @@ class LogitsProcessor(nn.Module):
                 hidden_states=hidden_states_to_store,
             )
         else:
+            del hidden_states
             input_logprobs = logits[input_logprob_indices]
-            del hidden_states, logits
+            del logits
 
             # Normalize the logprob w/o temperature, top-p
             pruned_lens = torch.tensor(
@@ -516,7 +517,8 @@ class LogitsProcessor(nn.Module):
             logits_buffer.copy_(logits[:, : self.config.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.config.vocab_size]
+            logits = logits.to(dtype=torch.float)
 
         if self.final_logit_softcapping:
             if not _is_npu:

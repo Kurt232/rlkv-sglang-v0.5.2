@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import time
+import types
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
