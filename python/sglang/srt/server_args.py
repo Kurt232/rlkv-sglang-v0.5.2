@@ -333,6 +333,10 @@ class ServerArgs:
     adapter_load_path: Optional[str] = None
     adapter_init_value: float = 1.0
 
+    # RLKV inference
+    enable_rlkv_inference: bool = False
+    rlkv_sparsity: float = 0.5
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -550,6 +554,15 @@ class ServerArgs:
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
+            )
+
+        if self.enable_rlkv_inference:
+            if self.attention_backend is None:
+                self.attention_backend = "triton"
+            self.disable_radix_cache = True
+            self.disable_cuda_graph = True
+            logger.info(
+                "RLKV inference: using triton backend, radix cache and cuda graph disabled"
             )
 
         if self.attention_backend == "torch_native":
@@ -1908,6 +1921,20 @@ class ServerArgs:
             type=float,
             default=ServerArgs.adapter_init_value,
             help="Initial value for the adapter weights in mixed attention.",
+        )
+
+        # RLKV inference
+        parser.add_argument(
+            "--enable-rlkv-inference",
+            action="store_true",
+            help="Enable RLKV inference with head-level KV cache compression.",
+        )
+        parser.add_argument(
+            "--rlkv-sparsity",
+            type=float,
+            default=ServerArgs.rlkv_sparsity,
+            help="Sparsity level for RLKV head binarization (0-1). "
+            "Higher means more heads are compressed.",
         )
 
         # Optimization/debug options

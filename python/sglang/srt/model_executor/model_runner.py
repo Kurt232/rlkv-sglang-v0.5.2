@@ -1676,6 +1676,76 @@ class ModelRunner:
         )
         return attn_backend
 
+    def _load_rlkv_head_masks(self):
+        """Load adapter weights and binarize into per-layer head masks for RLKV inference."""
+        import numpy as np
+
+        adapter_load_path = self.server_args.adapter_load_path
+        sparsity = self.server_args.rlkv_sparsity
+
+        if adapter_load_path is None:
+            raise ValueError(
+                "--adapter-load-path is required for --enable-rlkv-inference"
+            )
+
+        adapter_file = os.path.join(adapter_load_path, "adapter_weights.tsv")
+        if not os.path.exists(adapter_file):
+            # Try full_attention_heads.tsv as fallback
+            adapter_file = os.path.join(adapter_load_path, "full_attention_heads.tsv")
+
+        if not os.path.exists(adapter_file):
+            raise FileNotFoundError(
+                f"No adapter_weights.tsv or full_attention_heads.tsv found in {adapter_load_path}"
+            )
+
+        logger.info(f"Loading RLKV adapter weights from {adapter_file}")
+        adapter_weight = np.loadtxt(adapter_file, dtype=float, delimiter="\t")
+        adapter_weight = np.clip(adapter_weight, 0, 1)
+
+        # Binarize: threshold based on sparsity quantile
+        adapter_weight += np.random.uniform(0, 1e-6, adapter_weight.shape)
+        if sparsity >= 1:
+            threshold = 2.0
+        elif sparsity <= 0:
+            threshold = -1.0
+        else:
+            threshold = np.quantile(adapter_weight, sparsity)
+        binary_mask = (adapter_weight >= threshold).astype(float)
+
+        true_sparsity = 1 - np.mean(binary_mask)
+        logger.info(
+            f"RLKV head masks: requested sparsity={sparsity}, "
+            f"true sparsity={true_sparsity:.4f}, "
+            f"shape={binary_mask.shape}"
+        )
+
+        # Convert to per-layer head mask tensors
+        # binary_mask shape: [num_layers, num_kv_heads]
+        # After TP sharding, each rank gets a slice of the kv heads
+        tp_size = get_attention_tp_size()
+        num_kv_heads_per_tp = self.model_config.get_num_kv_heads(tp_size)
+        tp_rank = self.tp_rank
+
+        head_masks = {}
+        num_layers = binary_mask.shape[0]
+        for layer_id in range(num_layers):
+            full_mask = binary_mask[layer_id]  # [total_kv_heads]
+            # Shard for this TP rank
+            start = tp_rank * num_kv_heads_per_tp
+            end = start + num_kv_heads_per_tp
+            layer_mask = torch.tensor(
+                full_mask[start:end], dtype=torch.float32, device=self.device
+            )
+            head_masks[layer_id] = layer_mask
+            num_full = int(layer_mask.sum().item())
+            num_comp = num_kv_heads_per_tp - num_full
+            if layer_id < 3 or layer_id == num_layers - 1:
+                logger.info(
+                    f"  Layer {layer_id}: {num_full} full, {num_comp} compressed"
+                )
+
+        return head_masks
+
     def _get_attention_backend_from_str(self, backend_str: str):
         if backend_str == "flashinfer":
             if not self.use_mla_backend:
@@ -1727,6 +1797,14 @@ class ModelRunner:
 
                 logger.warning("MixedTritonAttnBackend")
                 return MixedTritonAttnBackend(self)
+            elif self.server_args.enable_rlkv_inference:
+                from sglang.srt.layers.attention.head_realloc_backend import (
+                    HeadReallocAttnBackend,
+                )
+
+                head_masks = self._load_rlkv_head_masks()
+                logger.info("HeadReallocAttnBackend enabled")
+                return HeadReallocAttnBackend(self, head_masks)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
