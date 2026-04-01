@@ -78,6 +78,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    HeadReallocAllocator,
     PagedTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -87,6 +88,7 @@ from sglang.srt.mem_cache.memory_pool import (
     AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
+    HeadReallocKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
@@ -1547,6 +1549,18 @@ class ModelRunner:
                     enable_kvcache_transpose=False,
                     device=self.device,
                 )
+            elif self.server_args.enable_rlkv_inference:
+                self.rlkv_head_masks = self._load_rlkv_head_masks()
+                self.token_to_kv_pool = HeadReallocKVPool(
+                    size_full=self.max_total_num_tokens,
+                    size_comp=self.max_total_num_tokens,
+                    head_masks=self.rlkv_head_masks,
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    dtype=self.kv_cache_dtype,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
             else:
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,
@@ -1581,6 +1595,15 @@ class ModelRunner:
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
+                    elif self.server_args.enable_rlkv_inference:
+                        self.token_to_kv_pool_allocator = HeadReallocAllocator(
+                            self.max_total_num_tokens,
+                            self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
@@ -1802,9 +1825,11 @@ class ModelRunner:
                     HeadReallocAttnBackend,
                 )
 
-                head_masks = self._load_rlkv_head_masks()
+                # Use pre-loaded head masks from init_memory_pool
+                if not hasattr(self, "rlkv_head_masks"):
+                    self.rlkv_head_masks = self._load_rlkv_head_masks()
                 logger.info("HeadReallocAttnBackend enabled")
-                return HeadReallocAttnBackend(self, head_masks)
+                return HeadReallocAttnBackend(self, self.rlkv_head_masks)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

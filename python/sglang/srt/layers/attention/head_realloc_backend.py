@@ -4,8 +4,10 @@ Head Reallocation Attention Backend.
 Implements head-level KV cache reallocation: full-attention heads retain
 complete KV cache, while compressed heads use only sink + recent window.
 
-V1: Uses the same KV pool for all heads (no memory savings yet).
-    Memory savings via dual pool will be added in V2.
+Supports two modes:
+- Single pool (V1): All heads share one KV pool, head indexing at read time.
+- Dual pool (V2): Separate full/comp pools via HeadReallocKVPool, no head
+  indexing at read time. set_kv_buffer splits heads automatically.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from sglang.srt.layers.attention.mixed_triton_backend import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.memory_pool import HeadReallocKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_device_core_count, next_power_of_2
 
@@ -47,6 +50,8 @@ class HeadReallocForwardMetadata:
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
+    # Comp pool kv indices (for dual pool extend)
+    comp_kv_indices: torch.Tensor
     # Extend metadata
     qo_indptr: torch.Tensor
     max_extend_len: int
@@ -59,6 +64,8 @@ class HeadReallocAttnBackend(AttentionBackend):
     Per layer, heads are statically classified as full or compressed.
     Full heads use standard full-context attention.
     Compressed heads use streaming attention (sink + recent window).
+
+    Supports both single-pool (V1) and dual-pool (V2) modes.
     """
 
     def __init__(
@@ -96,8 +103,12 @@ class HeadReallocAttnBackend(AttentionBackend):
         )
         self.num_kv_groups = self.num_head // self.num_kv_head
 
+        # Detect dual pool mode
+        self.use_dual_pool = isinstance(
+            model_runner.token_to_kv_pool, HeadReallocKVPool
+        )
+
         # Per-layer head masks and index tensors
-        # head_masks[layer_id] is [num_kv_heads] with 1=full, 0=compressed
         self.head_masks = head_masks
         self._precompute_head_indices(model_runner.device)
 
@@ -202,9 +213,10 @@ class HeadReallocAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
+        kv_pool = forward_batch.token_to_kv_pool
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # Full attention indices
+            # Full attention indices (pointing to full pool locations)
             kv_indptr = self.kv_indptr
             kv_indptr[1: bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -235,6 +247,12 @@ class HeadReallocAttnBackend(AttentionBackend):
                 )
             )
 
+            # For dual pool: translate window indices to comp pool locations
+            if self.use_dual_pool:
+                window_kv_indices = kv_pool.translate_loc_full_to_comp(
+                    window_kv_indices
+                )
+
             # Allocate logits/lse buffers (using full num_head for max size)
             attn_logits = torch.empty(
                 (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
@@ -263,6 +281,7 @@ class HeadReallocAttnBackend(AttentionBackend):
 
             qo_indptr = None
             max_extend_len = None
+            comp_kv_indices = None
 
         elif forward_batch.forward_mode.is_extend():
             # Extend mode (prefill)
@@ -285,6 +304,11 @@ class HeadReallocAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+
+            # For dual pool: translate prefix indices to comp pool locations
+            comp_kv_indices = None
+            if self.use_dual_pool and kv_indices.numel() > 0:
+                comp_kv_indices = kv_pool.translate_loc_full_to_comp(kv_indices)
 
             qo_indptr = self.qo_indptr
             qo_indptr[1: bs + 1] = torch.cumsum(
@@ -315,9 +339,31 @@ class HeadReallocAttnBackend(AttentionBackend):
             window_kv_indptr=window_kv_indptr,
             window_kv_indices=window_kv_indices,
             window_num_kv_splits=window_num_kv_splits,
+            comp_kv_indices=comp_kv_indices,
             qo_indptr=qo_indptr,
             max_extend_len=max_extend_len,
         )
+
+    def _get_kv_buffers(self, kv_pool, layer_id, group: str):
+        """Get K/V buffers for a head group.
+
+        In dual pool mode, buffers already contain only the relevant heads.
+        In single pool mode, we index-select from the shared buffer.
+        """
+        if self.use_dual_pool:
+            if group == "full":
+                return kv_pool.get_key_buffer(layer_id), kv_pool.get_value_buffer(layer_id)
+            else:
+                return kv_pool.get_comp_key_buffer(layer_id), kv_pool.get_comp_value_buffer(layer_id)
+        else:
+            # Single pool: index select by head
+            k_all = kv_pool.get_key_buffer(layer_id)
+            v_all = kv_pool.get_value_buffer(layer_id)
+            if group == "full":
+                idx = self.full_kv_head_indices[layer_id]
+            else:
+                idx = self.comp_kv_head_indices[layer_id]
+            return k_all[:, idx, :].contiguous(), v_all[:, idx, :].contiguous()
 
     def forward_decode(
         self,
@@ -332,7 +378,7 @@ class HeadReallocAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         bs = q.shape[0]
 
-        # Save KV cache (all heads, standard pool)
+        # Save KV cache (HeadReallocKVPool.set_kv_buffer splits heads internally)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
@@ -341,16 +387,9 @@ class HeadReallocAttnBackend(AttentionBackend):
         layer_id = layer.layer_id
         full_q_idx = self.full_q_head_indices[layer_id]
         comp_q_idx = self.comp_q_head_indices[layer_id]
-        restore_idx = self.restore_indices[layer_id]
 
         num_full_q = len(full_q_idx)
         num_comp_q = len(comp_q_idx)
-
-        full_k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
-        full_v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer_id)
-
-        full_kv_idx = self.full_kv_head_indices[layer_id]
-        comp_kv_idx = self.comp_kv_head_indices[layer_id]
 
         q_3d = q.view(bs, layer.tp_q_head_num, layer.qk_head_dim)
 
@@ -360,9 +399,9 @@ class HeadReallocAttnBackend(AttentionBackend):
         # --- Full attention heads ---
         if num_full_q > 0:
             q_full = q_3d[:, full_q_idx, :].contiguous()
-            # Select only the KV heads that correspond to full Q heads
-            k_buf = full_k_buffer[:, full_kv_idx, :].contiguous()
-            v_buf = full_v_buffer[:, full_kv_idx, :].contiguous()
+            k_buf, v_buf = self._get_kv_buffers(
+                forward_batch.token_to_kv_pool, layer_id, "full"
+            )
 
             o_part = torch.empty(
                 (bs, num_full_q, layer.v_head_dim),
@@ -397,9 +436,9 @@ class HeadReallocAttnBackend(AttentionBackend):
         # --- Compressed attention heads (streaming window) ---
         if num_comp_q > 0:
             q_comp = q_3d[:, comp_q_idx, :].contiguous()
-            # Select only the KV heads that correspond to compressed Q heads
-            k_buf = full_k_buffer[:, comp_kv_idx, :].contiguous()
-            v_buf = full_v_buffer[:, comp_kv_idx, :].contiguous()
+            k_buf, v_buf = self._get_kv_buffers(
+                forward_batch.token_to_kv_pool, layer_id, "comp"
+            )
 
             o_part = torch.empty(
                 (bs, num_comp_q, layer.v_head_dim),
@@ -457,9 +496,6 @@ class HeadReallocAttnBackend(AttentionBackend):
         num_full_q = len(full_q_idx)
         num_comp_q = len(comp_q_idx)
 
-        full_k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)
-        full_v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer_id)
-
         full_kv_idx = self.full_kv_head_indices[layer_id]
         comp_kv_idx = self.comp_kv_head_indices[layer_id]
 
@@ -478,8 +514,9 @@ class HeadReallocAttnBackend(AttentionBackend):
             q_part = q_3d[:, full_q_idx, :].contiguous()
             k_part = k_3d[:, full_kv_idx, :].contiguous()
             v_part = v_3d[:, full_kv_idx, :].contiguous()
-            k_buf = full_k_buffer[:, full_kv_idx, :].contiguous()
-            v_buf = full_v_buffer[:, full_kv_idx, :].contiguous()
+            k_buf, v_buf = self._get_kv_buffers(
+                forward_batch.token_to_kv_pool, layer_id, "full"
+            )
 
             o_part = torch.empty(
                 (num_tokens, num_full_q, layer.v_head_dim),
@@ -507,14 +544,18 @@ class HeadReallocAttnBackend(AttentionBackend):
             o_full[:, full_q_idx, :] = o_part
 
         # --- Compressed heads: causal, full attention during prefill ---
-        # (V1: compressed heads also do full attention during prefill,
-        #  eviction to window happens only during decode reads)
         if num_comp_q > 0:
             q_part = q_3d[:, comp_q_idx, :].contiguous()
             k_part = k_3d[:, comp_kv_idx, :].contiguous()
             v_part = v_3d[:, comp_kv_idx, :].contiguous()
-            k_buf = full_k_buffer[:, comp_kv_idx, :].contiguous()
-            v_buf = full_v_buffer[:, comp_kv_idx, :].contiguous()
+            k_buf, v_buf = self._get_kv_buffers(
+                forward_batch.token_to_kv_pool, layer_id, "comp"
+            )
+
+            # For dual pool, use translated comp indices for prefix buffer
+            extend_kv_indices = kv_indices
+            if self.use_dual_pool and self.forward_metadata.comp_kv_indices is not None:
+                extend_kv_indices = self.forward_metadata.comp_kv_indices
 
             o_part = torch.empty(
                 (num_tokens, num_comp_q, layer.v_head_dim),
@@ -529,7 +570,7 @@ class HeadReallocAttnBackend(AttentionBackend):
                 v_buf,
                 qo_indptr,
                 kv_indptr,
-                kv_indices,
+                extend_kv_indices,
                 None,  # custom_mask
                 True,  # causal
                 None,  # mask_indptr

@@ -846,6 +846,157 @@ class SWAKVPool(KVCache):
             )
 
 
+class HeadReallocKVPool(KVCache):
+    """KV cache with separate pools for full and compressed attention heads.
+
+    Full heads get a pool for all tokens (full context).
+    Compressed heads get a separate pool (for sink + recent window tokens).
+    Each pool has per-layer varying head counts based on head masks.
+    """
+
+    def __init__(
+        self,
+        size_full: int,
+        size_comp: int,
+        head_masks: Dict[int, torch.Tensor],
+        head_dim: int,
+        layer_num: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+    ):
+        super().__init__(
+            size_full, 1, dtype, layer_num, device, enable_memory_saver
+        )
+        self.size_full = size_full
+        self.size_comp = size_comp
+        self.head_dim = head_dim
+
+        # Per-layer head indices for splitting incoming KV
+        self.full_head_indices: Dict[int, torch.Tensor] = {}
+        self.comp_head_indices: Dict[int, torch.Tensor] = {}
+
+        for layer_id, mask in head_masks.items():
+            self.full_head_indices[layer_id] = torch.where(mask == 1)[0].to(device)
+            self.comp_head_indices[layer_id] = torch.where(mask == 0)[0].to(device)
+
+        # Create per-layer buffers with varying head counts
+        self.full_k_buffer = []
+        self.full_v_buffer = []
+        self.comp_k_buffer = []
+        self.comp_v_buffer = []
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            for l in range(layer_num):
+                n_full = len(self.full_head_indices.get(l, []))
+                n_comp = len(self.comp_head_indices.get(l, []))
+
+                self.full_k_buffer.append(
+                    torch.zeros(
+                        size_full + 1, n_full, head_dim,
+                        dtype=self.store_dtype, device=device,
+                    )
+                )
+                self.full_v_buffer.append(
+                    torch.zeros(
+                        size_full + 1, n_full, head_dim,
+                        dtype=self.store_dtype, device=device,
+                    )
+                )
+                self.comp_k_buffer.append(
+                    torch.zeros(
+                        size_comp + 1, n_comp, head_dim,
+                        dtype=self.store_dtype, device=device,
+                    )
+                )
+                self.comp_v_buffer.append(
+                    torch.zeros(
+                        size_comp + 1, n_comp, head_dim,
+                        dtype=self.store_dtype, device=device,
+                    )
+                )
+
+        # Mapping from full pool locations to comp pool locations (set by allocator)
+        self.full_to_comp_mapping: Optional[torch.Tensor] = None
+
+        self._finalize_allocation_log(size_full)
+
+    def get_kv_size_bytes(self):
+        k_size = sum(b.nelement() * b.element_size() for b in self.full_k_buffer)
+        k_size += sum(b.nelement() * b.element_size() for b in self.comp_k_buffer)
+        v_size = sum(b.nelement() * b.element_size() for b in self.full_v_buffer)
+        v_size += sum(b.nelement() * b.element_size() for b in self.comp_v_buffer)
+        return k_size, v_size
+
+    def translate_loc_full_to_comp(self, loc: torch.Tensor) -> torch.Tensor:
+        assert self.full_to_comp_mapping is not None
+        return self.full_to_comp_mapping[loc].to(torch.int32)
+
+    def get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.full_k_buffer[layer_id].view(self.dtype)
+        return self.full_k_buffer[layer_id]
+
+    def get_value_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.full_v_buffer[layer_id].view(self.dtype)
+        return self.full_v_buffer[layer_id]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_comp_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.comp_k_buffer[layer_id].view(self.dtype)
+        return self.comp_k_buffer[layer_id]
+
+    def get_comp_value_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.comp_v_buffer[layer_id].view(self.dtype)
+        return self.comp_v_buffer[layer_id]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        full_idx = self.full_head_indices[layer_id]
+        comp_idx = self.comp_head_indices[layer_id]
+
+        # Write full heads to full pool
+        if len(full_idx) > 0:
+            self.full_k_buffer[layer_id][loc] = cache_k[:, full_idx, :]
+            self.full_v_buffer[layer_id][loc] = cache_v[:, full_idx, :]
+
+        # Write comp heads to comp pool (translate location)
+        if len(comp_idx) > 0:
+            comp_loc = self.translate_loc_full_to_comp(loc)
+            self.comp_k_buffer[layer_id][comp_loc] = cache_k[:, comp_idx, :]
+            self.comp_v_buffer[layer_id][comp_loc] = cache_v[:, comp_idx, :]
+
+
 class AscendTokenToKVPool(MHATokenToKVPool):
 
     def _create_buffers(self):
