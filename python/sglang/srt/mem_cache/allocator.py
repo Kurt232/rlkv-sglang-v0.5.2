@@ -287,6 +287,103 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
 
+class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
+    """Allocator for head reallocation dual KV pool.
+
+    Manages two sub-allocators: one for full-attention heads (full capacity)
+    and one for compressed heads (smaller capacity for window tokens).
+    Maintains a mapping from full pool locations to comp pool locations.
+    """
+
+    def __init__(
+        self,
+        size_full: int,
+        size_comp: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache,
+        need_sort: bool,
+    ):
+        super().__init__(size_full, 1, dtype, device, kvcache, need_sort)
+        self._size_full = size_full
+        self._size_comp = size_comp
+
+        self.full_allocator = TokenToKVPoolAllocator(
+            size_full, dtype, device, kvcache, need_sort,
+        )
+        self.comp_allocator = TokenToKVPoolAllocator(
+            size_comp, dtype, device, kvcache, need_sort,
+        )
+
+        self.full_to_comp_mapping = torch.empty(
+            size_full + size_comp + 2,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.clear()
+        self._kvcache.full_to_comp_mapping = self.full_to_comp_mapping
+
+    def available_size(self):
+        return min(
+            self.full_allocator.available_size(),
+            self.comp_allocator.available_size(),
+        )
+
+    def full_available_size(self):
+        return self.full_allocator.available_size()
+
+    def comp_available_size(self):
+        return self.comp_allocator.available_size()
+
+    @property
+    def size_full(self):
+        return self._size_full
+
+    @property
+    def size_comp(self):
+        return self._size_comp
+
+    def debug_print(self) -> str:
+        return (
+            f"#full-available: {self.full_allocator.available_size()}, "
+            f"#comp-available: {self.comp_allocator.available_size()}"
+        )
+
+    def alloc(self, need_size: int):
+        if need_size > self.full_allocator.available_size():
+            return None
+        if need_size > self.comp_allocator.available_size():
+            return None
+
+        full_indices = self.full_allocator.alloc(need_size)
+        comp_indices = self.comp_allocator.alloc(need_size)
+        self.full_to_comp_mapping[full_indices] = comp_indices
+        return full_indices
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.is_not_in_free_group:
+            self.full_allocator.free(free_index)
+            self.free_comp(free_index)
+        else:
+            self.free_group.append(free_index)
+
+    def free_comp(self, free_index: torch.Tensor):
+        """Free only the comp pool locations corresponding to the given full pool indices."""
+        comp_indices = self.full_to_comp_mapping[free_index]
+        comp_indices = comp_indices[comp_indices > 0]
+        self.comp_allocator.free(comp_indices)
+        self.full_to_comp_mapping[free_index] = 0
+
+    def clear(self):
+        self.full_allocator.clear()
+        self.comp_allocator.clear()
+        self.full_to_comp_mapping.fill_(0)
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+
 @triton.jit
 def alloc_extend_kernel(
     pre_lens_ptr,
