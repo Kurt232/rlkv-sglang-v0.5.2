@@ -303,10 +303,14 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache,
         need_sort: bool,
+        sink_size: int = 16,
+        recent_size: int = 64,
     ):
         super().__init__(size_full, 1, dtype, device, kvcache, need_sort)
         self._size_full = size_full
         self._size_comp = size_comp
+        self.sink_size = sink_size
+        self.recent_size = recent_size
 
         self.full_allocator = TokenToKVPoolAllocator(
             size_full, dtype, device, kvcache, need_sort,
@@ -324,10 +328,9 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_comp_mapping = self.full_to_comp_mapping
 
     def available_size(self):
-        return min(
-            self.full_allocator.available_size(),
-            self.comp_allocator.available_size(),
-        )
+        # Scheduling is based on full pool capacity; comp pool is managed
+        # separately via eviction.
+        return self.full_allocator.available_size()
 
     def full_available_size(self):
         return self.full_allocator.available_size()
