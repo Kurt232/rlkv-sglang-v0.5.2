@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.attention.mixed_triton_backend import (
-    update_streaming_window_buffer,
     update_streaming_window_buffer_cuda_graph,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -50,8 +49,9 @@ class HeadReallocForwardMetadata:
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
     window_num_kv_splits: torch.Tensor
-    # Comp pool kv indices (for dual pool extend)
+    # Comp pool prefix metadata (for dual pool extend)
     comp_kv_indices: torch.Tensor
+    comp_kv_indptr: torch.Tensor
     # Extend metadata
     qo_indptr: torch.Tensor
     max_extend_len: int
@@ -234,17 +234,35 @@ class HeadReallocAttnBackend(AttentionBackend):
             )
 
             # Streaming window indices (for compressed heads)
-            window_kv_indptr, window_kv_indices, window_kv_lens = (
-                update_streaming_window_buffer(
-                    self.window_kv_indptr,
-                    self.req_to_token,
-                    self.sink_window_size,
-                    self.local_window_size,
-                    forward_batch.seq_lens,
-                    forward_batch.req_pool_indices,
-                    bs,
-                    self.device,
-                )
+            # Compute exact sink + recent window without block alignment.
+            # The shared update_streaming_window_buffer() uses block-aligned
+            # start indices, which can push the recent window past seq_len,
+            # reading garbage from req_to_token. With our small window sizes
+            # (sink=16, recent=64) the corruption can reach 50% of tokens.
+            window_kv_indptr = self.window_kv_indptr
+            window_kv_lens = torch.minimum(
+                forward_batch.seq_lens,
+                torch.tensor(
+                    self.sink_window_size + self.local_window_size,
+                    device=self.device,
+                ),
+            )
+            window_kv_indptr[1: bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+            window_kv_indptr = window_kv_indptr[: bs + 1]
+            window_kv_indices = torch.empty(
+                window_kv_indptr[-1], dtype=torch.int32, device=self.device
+            )
+            # For each request, gather sink [0, sink_size) and recent
+            # [seq_len - recent_size, seq_len) token locations
+            _build_sink_recent_indices[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                window_kv_indptr,
+                window_kv_indices,
+                self.sink_window_size,
+                self.local_window_size,
+                self.req_to_token.stride(0),
             )
 
             # For dual pool: translate window indices to comp pool locations
@@ -282,9 +300,12 @@ class HeadReallocAttnBackend(AttentionBackend):
             qo_indptr = None
             max_extend_len = None
             comp_kv_indices = None
+            comp_kv_indptr = None
 
         elif forward_batch.forward_mode.is_extend():
-            # Extend mode (prefill)
+            # Extend mode (prefill / chunked prefill)
+
+            # Full heads: attend to all prefix tokens
             kv_indptr = self.kv_indptr
             kv_indptr[1: bs + 1] = torch.cumsum(
                 forward_batch.extend_prefix_lens, dim=0
@@ -305,10 +326,40 @@ class HeadReallocAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
-            # For dual pool: translate prefix indices to comp pool locations
+            # Compressed heads: attend to compressed prefix (sink + recent)
+            # After eviction, comp pool only has window tokens of the prefix.
             comp_kv_indices = None
-            if self.use_dual_pool and kv_indices.numel() > 0:
-                comp_kv_indices = kv_pool.translate_loc_full_to_comp(kv_indices)
+            comp_kv_indptr = None
+            if self.use_dual_pool:
+                prefix_lens = forward_batch.extend_prefix_lens
+                window_prefix_lens = torch.minimum(
+                    prefix_lens,
+                    torch.tensor(
+                        self.sink_window_size + self.local_window_size,
+                        device=self.device,
+                    ),
+                )
+                comp_kv_indptr = torch.zeros(
+                    bs + 1, dtype=torch.int32, device=self.device
+                )
+                comp_kv_indptr[1: bs + 1] = torch.cumsum(window_prefix_lens, dim=0)
+                comp_kv_indices_raw = torch.empty(
+                    comp_kv_indptr[-1], dtype=torch.int32, device=self.device
+                )
+                if comp_kv_indices_raw.numel() > 0:
+                    _build_sink_recent_indices[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        prefix_lens,
+                        comp_kv_indptr,
+                        comp_kv_indices_raw,
+                        self.sink_window_size,
+                        self.local_window_size,
+                        self.req_to_token.stride(0),
+                    )
+                    comp_kv_indices = kv_pool.translate_loc_full_to_comp(
+                        comp_kv_indices_raw
+                    )
 
             qo_indptr = self.qo_indptr
             qo_indptr[1: bs + 1] = torch.cumsum(
@@ -340,6 +391,7 @@ class HeadReallocAttnBackend(AttentionBackend):
             window_kv_indices=window_kv_indices,
             window_num_kv_splits=window_num_kv_splits,
             comp_kv_indices=comp_kv_indices,
+            comp_kv_indptr=comp_kv_indptr if forward_batch.forward_mode.is_extend() else None,
             qo_indptr=qo_indptr,
             max_extend_len=max_extend_len,
         )
@@ -543,7 +595,7 @@ class HeadReallocAttnBackend(AttentionBackend):
             )
             o_full[:, full_q_idx, :] = o_part
 
-        # --- Compressed heads: causal, full attention during prefill ---
+        # --- Compressed heads: attend to compressed prefix + causal over current chunk ---
         if num_comp_q > 0:
             q_part = q_3d[:, comp_q_idx, :].contiguous()
             k_part = k_3d[:, comp_kv_idx, :].contiguous()
@@ -552,10 +604,12 @@ class HeadReallocAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool, layer_id, "comp"
             )
 
-            # For dual pool, use translated comp indices for prefix buffer
+            # Use compressed prefix indices (sink + recent of prefix only)
             extend_kv_indices = kv_indices
+            extend_kv_indptr = kv_indptr
             if self.use_dual_pool and self.forward_metadata.comp_kv_indices is not None:
                 extend_kv_indices = self.forward_metadata.comp_kv_indices
+                extend_kv_indptr = self.forward_metadata.comp_kv_indptr
 
             o_part = torch.empty(
                 (num_tokens, num_comp_q, layer.v_head_dim),
@@ -569,7 +623,7 @@ class HeadReallocAttnBackend(AttentionBackend):
                 k_buf,
                 v_buf,
                 qo_indptr,
-                kv_indptr,
+                extend_kv_indptr,
                 extend_kv_indices,
                 None,  # custom_mask
                 True,  # causal
@@ -583,6 +637,69 @@ class HeadReallocAttnBackend(AttentionBackend):
             o_full[:, comp_q_idx, :] = o_part
 
         return o_full.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
+
+
+@triton.jit
+def _build_sink_recent_indices(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    kv_indptr,
+    kv_indices_ptr,
+    sink_size: tl.constexpr,
+    recent_size: tl.constexpr,
+    req_to_token_stride: tl.constexpr,
+):
+    """Build exact sink + recent window indices without block alignment."""
+    BLOCK: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_pool_idx = tl.load(req_pool_indices_ptr + pid)
+    out_offset = tl.load(kv_indptr + pid)
+    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
+
+    total_window = sink_size + recent_size
+    if seq_len <= total_window:
+        # Entire sequence fits in window — copy all
+        num_loop = tl.cdiv(seq_len, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < seq_len
+            data = tl.load(
+                req_to_token_ptr + req_pool_idx * req_to_token_stride + offset,
+                mask=mask,
+            )
+            tl.store(kv_indices_ptr + out_offset + offset, data, mask=mask)
+    else:
+        # Sink: [0, sink_size)
+        num_loop = tl.cdiv(sink_size, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < sink_size
+            data = tl.load(
+                req_to_token_ptr + req_pool_idx * req_to_token_stride + offset,
+                mask=mask,
+            )
+            tl.store(kv_indices_ptr + out_offset + offset, data, mask=mask)
+
+        # Recent: [seq_len - recent_size, seq_len)
+        recent_start = seq_len - recent_size
+        num_loop = tl.cdiv(recent_size, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < recent_size
+            data = tl.load(
+                req_to_token_ptr
+                + req_pool_idx * req_to_token_stride
+                + recent_start
+                + offset,
+                mask=mask,
+            )
+            tl.store(
+                kv_indices_ptr + out_offset + sink_size + offset,
+                data,
+                mask=mask,
+            )
 
 
 # Reuse the triton kernel from mixed_triton_backend for kv_splits calculation

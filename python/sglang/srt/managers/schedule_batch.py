@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
+    HeadReallocAllocator,
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -456,6 +457,8 @@ class Req:
 
         # The length of KV that have been removed in local attention chunked prefill
         self.evicted_seqlen_local = 0
+        # For RLKV: cursor for comp pool eviction (positions < cursor are evicted)
+        self.comp_evict_cursor = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1197,6 +1200,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     self.tree_cache.evict_swa(
                         req, pre_len, self.model_config.attention_chunk_size
                     )
+                # RLKV: evict comp pool for prefix tokens outside window
+                if isinstance(self.token_to_kv_pool_allocator, HeadReallocAllocator):
+                    sink = self.token_to_kv_pool_allocator.sink_size
+                    recent = self.token_to_kv_pool_allocator.recent_size
+                    evict_end = max(sink, pre_len - recent)
+                    cursor = req.comp_evict_cursor if req.comp_evict_cursor > 0 else sink
+                    if evict_end > cursor:
+                        full_locs = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, cursor:evict_end
+                        ]
+                        self.token_to_kv_pool_allocator.free_comp(full_locs)
+                        req.comp_evict_cursor = evict_end
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1577,6 +1592,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.evict_swa(
                     req, req.seqlen - 1, self.model_config.attention_chunk_size
                 )
+
+        # RLKV: evict comp pool tokens outside sink+recent window
+        if isinstance(self.token_to_kv_pool_allocator, HeadReallocAllocator):
+            sink = self.token_to_kv_pool_allocator.sink_size
+            recent = self.token_to_kv_pool_allocator.recent_size
+            for i, req in enumerate(self.reqs):
+                seq_len = self.seq_lens[i].item()
+                # Eviction target: everything in [sink, seq_len - recent) should go
+                evict_end = max(sink, seq_len - recent)
+                cursor = req.comp_evict_cursor if req.comp_evict_cursor > 0 else sink
+                if evict_end > cursor:
+                    # Evict positions [cursor, evict_end)
+                    full_locs = self.req_to_token_pool.req_to_token[
+                        self.req_pool_indices[i], cursor:evict_end
+                    ]
+                    self.token_to_kv_pool_allocator.free_comp(full_locs)
+                    req.comp_evict_cursor = evict_end
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:

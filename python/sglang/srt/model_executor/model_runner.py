@@ -1551,9 +1551,27 @@ class ModelRunner:
                 )
             elif self.server_args.enable_rlkv_inference:
                 self.rlkv_head_masks = self._load_rlkv_head_masks()
+                # Comp pool: only needs sink+recent per request after eviction,
+                # but must hold a full prefill chunk during extend.
+                sink = self.server_args.sink_window_size
+                recent = self.server_args.recent_window_size
+                window = sink + recent
+                chunked = getattr(self.server_args, 'chunked_prefill_size', 8192) or 8192
+                self.rlkv_comp_pool_size = max(
+                    chunked * 2,
+                    self.max_total_num_tokens * window // self.model_config.context_len * 8,
+                )
+                self.rlkv_comp_pool_size = min(
+                    self.rlkv_comp_pool_size, self.max_total_num_tokens
+                )
+                logger.info(
+                    f"RLKV pool sizes: full={self.max_total_num_tokens}, "
+                    f"comp={self.rlkv_comp_pool_size} "
+                    f"(window={window}, saving ~{100*(1 - self.rlkv_comp_pool_size/self.max_total_num_tokens):.0f}% comp memory)"
+                )
                 self.token_to_kv_pool = HeadReallocKVPool(
                     size_full=self.max_total_num_tokens,
-                    size_comp=self.max_total_num_tokens,
+                    size_comp=self.rlkv_comp_pool_size,
                     head_masks=self.rlkv_head_masks,
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
@@ -1603,11 +1621,13 @@ class ModelRunner:
                     elif self.server_args.enable_rlkv_inference:
                         self.token_to_kv_pool_allocator = HeadReallocAllocator(
                             self.max_total_num_tokens,
-                            self.max_total_num_tokens,
+                            self.rlkv_comp_pool_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            sink_size=self.server_args.sink_window_size,
+                            recent_size=self.server_args.recent_window_size,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
