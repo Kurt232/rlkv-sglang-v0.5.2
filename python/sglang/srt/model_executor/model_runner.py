@@ -1551,26 +1551,57 @@ class ModelRunner:
                 )
             elif self.server_args.enable_rlkv_inference:
                 self.rlkv_head_masks = self._load_rlkv_head_masks()
-                # Comp pool: only needs sink+recent per request after eviction,
-                # but must hold a full prefill chunk during extend.
                 sink = self.server_args.sink_window_size
                 recent = self.server_args.recent_window_size
                 window = sink + recent
                 chunked = getattr(self.server_args, 'chunked_prefill_size', 8192) or 8192
+
+                # Memory rebalancing: reclaim comp pool savings for a larger full pool.
+                # Original max_total_num_tokens assumes all heads at full size.
+                # With dual pool, comp heads use much less memory (small pool).
+                # Solve: full_tokens * avg_full_heads + comp_tokens * avg_comp_heads
+                #        = original_tokens * total_heads
+                num_kv_heads = self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                )
+                avg_full = sum(
+                    float(m.sum()) for m in self.rlkv_head_masks.values()
+                ) / len(self.rlkv_head_masks)
+                avg_comp = num_kv_heads - avg_full
+
+                # Reclaim: original budget = max_total_num_tokens * num_kv_heads
+                # Solve: full_tokens * avg_full + comp_tokens * avg_comp = budget
+                # comp_tokens = full_tokens * window / context_len * safety_margin
+                original_budget = self.max_total_num_tokens * num_kv_heads
+                context_len = self.model_config.context_len
+                # comp pool must hold: concurrent decode windows + prefill headroom
+                # Use ratio: comp = full * window / context * margin
+                comp_ratio = window / context_len * 8
+                # full * avg_full + (full * comp_ratio) * avg_comp = budget
+                rlkv_full_pool_size = int(
+                    original_budget / (avg_full + comp_ratio * avg_comp)
+                ) if avg_full > 0 else self.max_total_num_tokens
+                rlkv_full_pool_size = max(
+                    rlkv_full_pool_size, self.max_total_num_tokens
+                )
+                # comp pool must hold: all concurrent decode windows + prefill headroom.
+                # Use 10% of full pool as minimum (handles high concurrency).
                 self.rlkv_comp_pool_size = max(
                     chunked * 2,
-                    self.max_total_num_tokens * window // self.model_config.context_len * 8,
+                    int(rlkv_full_pool_size * comp_ratio),
+                    rlkv_full_pool_size // 10,
                 )
-                self.rlkv_comp_pool_size = min(
-                    self.rlkv_comp_pool_size, self.max_total_num_tokens
-                )
+
                 logger.info(
-                    f"RLKV pool sizes: full={self.max_total_num_tokens}, "
-                    f"comp={self.rlkv_comp_pool_size} "
-                    f"(window={window}, saving ~{100*(1 - self.rlkv_comp_pool_size/self.max_total_num_tokens):.0f}% comp memory)"
+                    f"RLKV memory rebalancing: original={self.max_total_num_tokens} tokens, "
+                    f"full_pool={rlkv_full_pool_size} ({rlkv_full_pool_size/self.max_total_num_tokens:.2f}x), "
+                    f"comp_pool={self.rlkv_comp_pool_size} "
+                    f"(avg_full={avg_full:.1f}, avg_comp={avg_comp:.1f}, window={window})"
                 )
+                self.max_total_num_tokens = rlkv_full_pool_size
+
                 self.token_to_kv_pool = HeadReallocKVPool(
-                    size_full=self.max_total_num_tokens,
+                    size_full=rlkv_full_pool_size,
                     size_comp=self.rlkv_comp_pool_size,
                     head_masks=self.rlkv_head_masks,
                     head_dim=self.model_config.head_dim,
