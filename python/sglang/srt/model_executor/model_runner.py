@@ -1554,55 +1554,69 @@ class ModelRunner:
                 sink = self.server_args.sink_window_size
                 recent = self.server_args.recent_window_size
                 window = sink + recent
-                chunked = getattr(self.server_args, 'chunked_prefill_size', 8192) or 8192
 
-                # Memory rebalancing: reclaim comp pool savings for a larger full pool.
-                # Original max_total_num_tokens assumes all heads at full size.
-                # With dual pool, comp heads use much less memory (small pool).
-                # Solve: full_tokens * avg_full_heads + comp_tokens * avg_comp_heads
-                #        = original_tokens * total_heads
+                # Memory rebalancing for RLKV dual KV pool.
+                #
+                # Comp pool uses implicit allocation: each request gets
+                # `window` comp slots at [1 + req_pool_idx * window, ...).
+                # So comp_pool_size = max_num_reqs * window.
+                #
+                # Budget equation (in head-slots):
+                #   full_pool * total_full + comp_pool * total_comp = budget
+                #   budget = max_total_num_tokens * total_heads
+                #
+                # Solve for full_pool:
+                #   full_pool = (budget - comp_pool * total_comp) / total_full
                 num_kv_heads = self.model_config.get_num_kv_heads(
                     get_attention_tp_size()
                 )
-                avg_full = sum(
-                    float(m.sum()) for m in self.rlkv_head_masks.values()
-                ) / len(self.rlkv_head_masks)
-                avg_comp = num_kv_heads - avg_full
+                num_layers = len(self.rlkv_head_masks)
 
-                # Reclaim: original budget = max_total_num_tokens * num_kv_heads
-                # Solve: full_tokens * avg_full + comp_tokens * avg_comp = budget
-                # comp_tokens = full_tokens * window / context_len * safety_margin
-                original_budget = self.max_total_num_tokens * num_kv_heads
+                total_full_heads = sum(
+                    int(m.sum().item()) for m in self.rlkv_head_masks.values()
+                )
+                total_comp_heads = num_kv_heads * num_layers - total_full_heads
+                total_heads = total_full_heads + total_comp_heads
+
+                budget = self.max_total_num_tokens * total_heads
                 context_len = self.model_config.context_len
-                # comp pool must hold: concurrent decode windows + prefill headroom
-                # Use ratio: comp = full * window / context * margin
-                comp_ratio = window / context_len * 8
-                # full * avg_full + (full * comp_ratio) * avg_comp = budget
-                rlkv_full_pool_size = int(
-                    original_budget / (avg_full + comp_ratio * avg_comp)
-                ) if avg_full > 0 else self.max_total_num_tokens
+
+                # Max concurrent from worst-case budget equation
+                per_req_cost = (
+                    context_len * total_full_heads + window * total_comp_heads
+                )
+                max_concurrent_worst = budget // per_req_cost if per_req_cost > 0 else 1
+                # 16x headroom for shorter sequences, capped at max_num_reqs
+                rlkv_max_concurrent = min(
+                    max_concurrent_worst * 16, max_num_reqs
+                )
+                rlkv_comp_pool_size = rlkv_max_concurrent * window
+
+                if total_full_heads > 0:
+                    rlkv_full_pool_size = (
+                        budget - rlkv_comp_pool_size * total_comp_heads
+                    ) // total_full_heads
+                else:
+                    rlkv_full_pool_size = self.max_total_num_tokens
+
+                # Ensure at least as good as original
                 rlkv_full_pool_size = max(
                     rlkv_full_pool_size, self.max_total_num_tokens
                 )
-                # comp pool must hold: all concurrent decode windows + prefill headroom.
-                # Use 10% of full pool as minimum (handles high concurrency).
-                self.rlkv_comp_pool_size = max(
-                    chunked * 2,
-                    int(rlkv_full_pool_size * comp_ratio),
-                    rlkv_full_pool_size // 10,
-                )
 
                 logger.info(
-                    f"RLKV memory rebalancing: original={self.max_total_num_tokens} tokens, "
-                    f"full_pool={rlkv_full_pool_size} ({rlkv_full_pool_size/self.max_total_num_tokens:.2f}x), "
-                    f"comp_pool={self.rlkv_comp_pool_size} "
-                    f"(avg_full={avg_full:.1f}, avg_comp={avg_comp:.1f}, window={window})"
+                    f"RLKV memory rebalancing: "
+                    f"full_pool={rlkv_full_pool_size} "
+                    f"({rlkv_full_pool_size/self.max_total_num_tokens:.2f}x), "
+                    f"comp_pool={rlkv_comp_pool_size} "
+                    f"(max_concurrent={rlkv_max_concurrent} × window={window}), "
+                    f"T_full={total_full_heads}, T_comp={total_comp_heads}"
                 )
                 self.max_total_num_tokens = rlkv_full_pool_size
 
                 self.token_to_kv_pool = HeadReallocKVPool(
                     size_full=rlkv_full_pool_size,
-                    size_comp=self.rlkv_comp_pool_size,
+                    size_comp=rlkv_comp_pool_size,
                     head_masks=self.rlkv_head_masks,
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
@@ -1650,15 +1664,18 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                     elif self.server_args.enable_rlkv_inference:
+                        rlkv_window = (
+                            self.server_args.sink_window_size
+                            + self.server_args.recent_window_size
+                        )
                         self.token_to_kv_pool_allocator = HeadReallocAllocator(
                             self.max_total_num_tokens,
-                            self.rlkv_comp_pool_size,
+                            self.token_to_kv_pool.size_comp,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
-                            sink_size=self.server_args.sink_window_size,
-                            recent_size=self.server_args.recent_window_size,
+                            window_size=rlkv_window,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -1880,7 +1897,9 @@ class ModelRunner:
                 if not hasattr(self, "rlkv_head_masks"):
                     self.rlkv_head_masks = self._load_rlkv_head_masks()
                 logger.info("HeadReallocAttnBackend enabled")
-                return HeadReallocAttnBackend(self, self.rlkv_head_masks)
+                backend = HeadReallocAttnBackend(self, self.rlkv_head_masks)
+                backend._allocator_ref = self.token_to_kv_pool_allocator
+                return backend
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

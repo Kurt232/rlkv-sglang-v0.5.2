@@ -108,6 +108,7 @@ class HeadReallocAttnBackend(AttentionBackend):
             model_runner.token_to_kv_pool, HeadReallocKVPool
         )
         self._kvcache_ref = model_runner.token_to_kv_pool
+        self._allocator_ref = None  # set after allocator is created
 
         # Per-layer head masks and index tensors
         self.head_masks = head_masks
@@ -134,15 +135,15 @@ class HeadReallocAttnBackend(AttentionBackend):
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
 
         self.forward_metadata: HeadReallocForwardMetadata = None
+        self.window_size = self.sink_window_size + self.local_window_size
 
         # Pre-allocate decode index buffers to avoid per-step torch.empty()
         max_kv_total = max_bs * self.max_context_len
-        window_size = self.sink_window_size + self.local_window_size
         self._kv_indices_buf = torch.empty(
             max_kv_total, dtype=torch.int32, device=self.device
         )
         self._window_kv_indices_buf = torch.empty(
-            max_bs * window_size, dtype=torch.int32, device=self.device
+            max_bs * self.window_size, dtype=torch.int32, device=self.device
         )
 
     def _precompute_head_indices(self, device: str):
@@ -190,6 +191,134 @@ class HeadReallocAttnBackend(AttentionBackend):
             restore[combined] = torch.arange(len(combined), device=device)
             self.restore_indices[layer_id] = restore.long()
 
+    def _get_comp_base(self, req_pool_idx: int) -> int:
+        """Get or allocate a comp chunk for a request.
+
+        Returns comp_base (>0) if available, 0 if comp pool exhausted.
+        Allocates a new chunk from the allocator on first call for a request.
+        """
+        allocator = self._allocator_ref
+        if allocator is None:
+            return 0
+        # Check if this request already has a comp base by looking at
+        # any existing mapped full_loc. If the first token (position 0)
+        # has a non-zero mapping, derive comp_base from it.
+        first_full_loc = self.req_to_token[req_pool_idx, 0].long().item()
+        if first_full_loc > 0:
+            existing = allocator.full_to_comp_mapping[first_full_loc].item()
+            if existing > 0:
+                return (
+                    (existing - 1) // allocator.window_size
+                    * allocator.window_size + 1
+                )
+        # No existing comp base — allocate a new chunk
+        return allocator.alloc_comp_window()
+
+    def _update_comp_mapping_decode(
+        self,
+        kv_pool,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        bs: int,
+    ):
+        """Update full_to_comp_mapping for new decode tokens.
+
+        Each new token's comp slot is computed as:
+          comp_base = request's allocated comp chunk start
+          if pos < sink: comp_idx = comp_base + pos
+          else: comp_idx = comp_base + sink + (pos - sink) % recent
+        """
+        if not self.use_dual_pool:
+            return
+        # New token is at position seq_lens - 1 (seq_lens already incremented)
+        positions = seq_lens[:bs] - 1
+        # Read out_cache_loc from req_to_token (written by prepare_for_decode)
+        out_cache_loc = self.req_to_token[
+            req_pool_indices[:bs], positions
+        ].long()
+
+        # Vectorized comp base lookup: read mapping of position 0 per request
+        first_full_locs = self.req_to_token[
+            req_pool_indices[:bs], torch.zeros(bs, dtype=torch.long, device=self.device)
+        ].long()
+        existing_comp = kv_pool.full_to_comp_mapping[first_full_locs]
+        # Derive comp_base: (comp_idx - 1) // window * window + 1
+        comp_bases = torch.where(
+            existing_comp > 0,
+            (existing_comp - 1) // self.window_size * self.window_size + 1,
+            torch.zeros_like(existing_comp),
+        )
+
+        is_sink = positions < self.sink_window_size
+        comp_offsets = torch.where(
+            is_sink,
+            positions,
+            self.sink_window_size
+            + (positions - self.sink_window_size) % self.local_window_size,
+        )
+        comp_indices = torch.where(
+            comp_bases > 0,
+            comp_bases + comp_offsets,
+            torch.zeros_like(comp_offsets),
+        )
+        kv_pool.full_to_comp_mapping[out_cache_loc] = comp_indices
+
+    def _update_comp_mapping_extend(
+        self,
+        kv_pool,
+        forward_batch: ForwardBatch,
+    ):
+        """Update full_to_comp_mapping for new extend tokens.
+
+        Allocates comp chunks for new requests. Only tokens in the final
+        sink+recent window get real comp mappings. Other positions get
+        mapping=0 (writes to padding slot, harmless).
+        """
+        if not self.use_dual_pool:
+            return
+        bs = forward_batch.batch_size
+        for i in range(bs):
+            req_pool_idx = forward_batch.req_pool_indices[i].item()
+            prefix_len = forward_batch.extend_prefix_lens[i].item()
+            seq_len = forward_batch.seq_lens[i].item()
+
+            # Get or allocate comp chunk for this request
+            comp_base = self._get_comp_base(req_pool_idx)
+            if comp_base == 0:
+                continue  # No comp available, skip
+
+            # Get full_locs for the new tokens
+            full_locs = self.req_to_token[
+                req_pool_idx, prefix_len:seq_len
+            ].long()
+
+            # Compute positions for each new token
+            positions = torch.arange(
+                prefix_len, seq_len, device=self.device, dtype=torch.long
+            )
+
+            # Comp mapping: only sink + last recent tokens get real comp slots
+            is_sink = positions < self.sink_window_size
+            recent_start = max(
+                self.sink_window_size,
+                seq_len - self.local_window_size,
+            )
+            is_recent = positions >= recent_start
+            in_window = is_sink | is_recent
+
+            comp_offsets = torch.where(
+                is_sink,
+                positions,
+                self.sink_window_size
+                + (positions - self.sink_window_size) % self.local_window_size,
+            )
+            comp_indices = torch.where(
+                in_window,
+                comp_base + comp_offsets,
+                torch.zeros_like(comp_offsets),  # 0 = padding slot
+            )
+            kv_pool.full_to_comp_mapping[full_locs] = comp_indices
+
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -227,6 +356,12 @@ class HeadReallocAttnBackend(AttentionBackend):
         kv_pool = forward_batch.token_to_kv_pool
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # Update comp mapping for new decode tokens BEFORE building indices
+            self._update_comp_mapping_decode(
+                kv_pool, forward_batch.req_pool_indices,
+                forward_batch.seq_lens, bs,
+            )
+
             # Full attention indices (pointing to full pool locations)
             kv_indptr = self.kv_indptr
             kv_indptr[1: bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -303,6 +438,9 @@ class HeadReallocAttnBackend(AttentionBackend):
 
         elif forward_batch.forward_mode.is_extend():
             # Extend mode (prefill / chunked prefill)
+
+            # Update comp mapping for new extend tokens
+            self._update_comp_mapping_extend(kv_pool, forward_batch)
 
             # Full heads: attend to all prefix tokens
             kv_indptr = self.kv_indptr
@@ -433,6 +571,11 @@ class HeadReallocAttnBackend(AttentionBackend):
         encoder_lens, forward_mode, spec_info,
     ):
         """Build metadata during CUDA graph capture using pre-allocated buffers."""
+        # Update comp mapping for decode tokens
+        self._update_comp_mapping_decode(
+            self._kvcache_ref, req_pool_indices, seq_lens, bs,
+        )
+
         kv_indptr = self.cuda_graph_kv_indptr
         kv_indptr[1: bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
         kv_indptr = kv_indptr[: bs + 1]
@@ -493,6 +636,11 @@ class HeadReallocAttnBackend(AttentionBackend):
         encoder_lens, forward_mode, spec_info, seq_lens_cpu=None,
     ):
         """Update metadata in-place during CUDA graph replay."""
+        # Update comp mapping for decode tokens
+        self._update_comp_mapping_decode(
+            self._kvcache_ref, req_pool_indices, seq_lens, bs,
+        )
+
         kv_indptr = self.cuda_graph_kv_indptr
         kv_indptr[1: bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
 
