@@ -107,6 +107,7 @@ class HeadReallocAttnBackend(AttentionBackend):
         self.use_dual_pool = isinstance(
             model_runner.token_to_kv_pool, HeadReallocKVPool
         )
+        self._kvcache_ref = model_runner.token_to_kv_pool
 
         # Per-layer head masks and index tensors
         self.head_masks = head_masks
@@ -393,6 +394,157 @@ class HeadReallocAttnBackend(AttentionBackend):
             qo_indptr=qo_indptr,
             max_extend_len=max_extend_len,
         )
+
+    # ---- CUDA Graph support ----
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens, kv_indices_buf=None):
+        """Pre-allocate all buffers for CUDA graph capture/replay."""
+        window_size = self.sink_window_size + self.local_window_size
+
+        # Full heads: kv indices covering full context
+        self.cuda_graph_kv_indices = torch.zeros(
+            max_num_tokens * self.max_context_len,
+            dtype=torch.int32, device=self.device,
+        )
+        # Comp heads: window indices (already translated to comp pool)
+        self.cuda_graph_window_kv_indices = torch.zeros(
+            max_num_tokens * window_size,
+            dtype=torch.int32, device=self.device,
+        )
+        # Indptrs
+        self.cuda_graph_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device,
+        )
+        self.cuda_graph_window_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device,
+        )
+        # Splits
+        self.cuda_graph_num_kv_splits = torch.full(
+            (max_num_tokens,), self.max_kv_splits,
+            dtype=torch.int32, device=self.device,
+        )
+        self.cuda_graph_window_num_kv_splits = torch.full(
+            (max_num_tokens,), self.max_kv_splits,
+            dtype=torch.int32, device=self.device,
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self, bs, num_tokens, req_pool_indices, seq_lens,
+        encoder_lens, forward_mode, spec_info,
+    ):
+        """Build metadata during CUDA graph capture using pre-allocated buffers."""
+        kv_indptr = self.cuda_graph_kv_indptr
+        kv_indptr[1: bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+        kv_indptr = kv_indptr[: bs + 1]
+
+        seq_lens_sum = seq_lens[:bs].sum().item()
+        kv_indices = self.cuda_graph_kv_indices[:seq_lens_sum]
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token, req_pool_indices, seq_lens[:bs],
+            kv_indptr, None, kv_indices, self.req_to_token.stride(0),
+        )
+
+        # Window indices for comp heads
+        window_size = self.sink_window_size + self.local_window_size
+        window_kv_lens = torch.minimum(
+            seq_lens[:bs], torch.tensor(window_size, device=self.device),
+        )
+        window_kv_indptr = self.cuda_graph_window_kv_indptr
+        window_kv_indptr[1: bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+        window_kv_indptr = window_kv_indptr[: bs + 1]
+
+        total_window = window_kv_indptr[-1].item()
+        window_kv_indices = self.cuda_graph_window_kv_indices[:total_window]
+        if self.use_dual_pool:
+            kv_pool = self._kvcache_ref
+            _build_sink_recent_comp_indices[(bs,)](
+                self.req_to_token, req_pool_indices, seq_lens[:bs],
+                window_kv_indptr, window_kv_indices,
+                kv_pool.full_to_comp_mapping,
+                self.sink_window_size, self.local_window_size,
+                self.req_to_token.stride(0),
+            )
+        else:
+            _build_sink_recent_indices[(bs,)](
+                self.req_to_token, req_pool_indices, seq_lens[:bs],
+                window_kv_indptr, window_kv_indices,
+                self.sink_window_size, self.local_window_size,
+                self.req_to_token.stride(0),
+            )
+
+        num_kv_splits = self.cuda_graph_num_kv_splits[:bs]
+        self.get_num_kv_splits(num_kv_splits, seq_lens[:bs], self.num_head, self.num_kv_head)
+        window_num_kv_splits = self.cuda_graph_window_num_kv_splits[:bs]
+        self.get_num_kv_splits(window_num_kv_splits, window_kv_lens, self.num_head, self.num_kv_head)
+
+        self.forward_metadata = HeadReallocForwardMetadata(
+            attn_logits=None, attn_lse=None,
+            num_kv_splits=num_kv_splits,
+            kv_indptr=kv_indptr, kv_indices=kv_indices,
+            window_kv_indptr=window_kv_indptr,
+            window_kv_indices=window_kv_indices,
+            window_num_kv_splits=window_num_kv_splits,
+            comp_kv_indices=None, comp_kv_indptr=None,
+            qo_indptr=None, max_extend_len=None,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, bs, req_pool_indices, seq_lens, seq_lens_sum,
+        encoder_lens, forward_mode, spec_info, seq_lens_cpu=None,
+    ):
+        """Update metadata in-place during CUDA graph replay."""
+        kv_indptr = self.cuda_graph_kv_indptr
+        kv_indptr[1: bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+
+        kv_indices = self.cuda_graph_kv_indices
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token, req_pool_indices, seq_lens[:bs],
+            kv_indptr, None, kv_indices, self.req_to_token.stride(0),
+        )
+
+        window_size = self.sink_window_size + self.local_window_size
+        window_kv_lens = torch.minimum(
+            seq_lens[:bs], torch.tensor(window_size, device=self.device),
+        )
+        window_kv_indptr = self.cuda_graph_window_kv_indptr
+        window_kv_indptr[1: bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+
+        window_kv_indices = self.cuda_graph_window_kv_indices
+        if self.use_dual_pool:
+            kv_pool = self._kvcache_ref
+            _build_sink_recent_comp_indices[(bs,)](
+                self.req_to_token, req_pool_indices, seq_lens[:bs],
+                window_kv_indptr, window_kv_indices,
+                kv_pool.full_to_comp_mapping,
+                self.sink_window_size, self.local_window_size,
+                self.req_to_token.stride(0),
+            )
+        else:
+            _build_sink_recent_indices[(bs,)](
+                self.req_to_token, req_pool_indices, seq_lens[:bs],
+                window_kv_indptr, window_kv_indices,
+                self.sink_window_size, self.local_window_size,
+                self.req_to_token.stride(0),
+            )
+
+        num_kv_splits = self.cuda_graph_num_kv_splits[:bs]
+        self.get_num_kv_splits(num_kv_splits, seq_lens[:bs], self.num_head, self.num_kv_head)
+        window_num_kv_splits = self.cuda_graph_window_num_kv_splits[:bs]
+        self.get_num_kv_splits(window_num_kv_splits, window_kv_lens, self.num_head, self.num_kv_head)
+
+        self.forward_metadata = HeadReallocForwardMetadata(
+            attn_logits=None, attn_lse=None,
+            num_kv_splits=num_kv_splits,
+            kv_indptr=kv_indptr[:bs + 1], kv_indices=kv_indices,
+            window_kv_indptr=window_kv_indptr[:bs + 1],
+            window_kv_indices=window_kv_indices,
+            window_num_kv_splits=window_num_kv_splits,
+            comp_kv_indices=None, comp_kv_indptr=None,
+            qo_indptr=None, max_extend_len=None,
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     def _get_kv_buffers(self, kv_pool, layer_id, group: str):
         """Get K/V buffers for a head group.
