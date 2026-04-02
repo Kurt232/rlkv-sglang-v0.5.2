@@ -560,9 +560,8 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "triton"
             self.disable_radix_cache = True
-            self.disable_cuda_graph = True
             logger.info(
-                "RLKV inference: using triton backend, radix cache and cuda graph disabled"
+                "RLKV inference: using triton backend, radix cache disabled"
             )
 
         if self.attention_backend == "torch_native":
