@@ -134,6 +134,16 @@ class HeadReallocAttnBackend(AttentionBackend):
 
         self.forward_metadata: HeadReallocForwardMetadata = None
 
+        # Pre-allocate decode index buffers to avoid per-step torch.empty()
+        max_kv_total = max_bs * self.max_context_len
+        window_size = self.sink_window_size + self.local_window_size
+        self._kv_indices_buf = torch.empty(
+            max_kv_total, dtype=torch.int32, device=self.device
+        )
+        self._window_kv_indices_buf = torch.empty(
+            max_bs * window_size, dtype=torch.int32, device=self.device
+        )
+
     def _precompute_head_indices(self, device: str):
         """Precompute full/compressed head indices and Q-head expansion for each layer."""
         self.full_kv_head_indices: Dict[int, torch.Tensor] = {}
@@ -220,9 +230,7 @@ class HeadReallocAttnBackend(AttentionBackend):
             kv_indptr = self.kv_indptr
             kv_indptr[1: bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
-            )
+            kv_indices = self._kv_indices_buf[:forward_batch.seq_lens_sum]
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 forward_batch.req_pool_indices,
@@ -233,55 +241,45 @@ class HeadReallocAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
-            # Streaming window indices (for compressed heads)
-            # Compute exact sink + recent window without block alignment.
-            # The shared update_streaming_window_buffer() uses block-aligned
-            # start indices, which can push the recent window past seq_len,
-            # reading garbage from req_to_token. With our small window sizes
-            # (sink=16, recent=64) the corruption can reach 50% of tokens.
-            window_kv_indptr = self.window_kv_indptr
+            # Window indices for compressed heads
+            window_size = self.sink_window_size + self.local_window_size
             window_kv_lens = torch.minimum(
                 forward_batch.seq_lens,
-                torch.tensor(
-                    self.sink_window_size + self.local_window_size,
-                    device=self.device,
-                ),
+                torch.tensor(window_size, device=self.device),
             )
+            window_kv_indptr = self.window_kv_indptr
             window_kv_indptr[1: bs + 1] = torch.cumsum(window_kv_lens, dim=0)
             window_kv_indptr = window_kv_indptr[: bs + 1]
-            window_kv_indices = torch.empty(
-                window_kv_indptr[-1], dtype=torch.int32, device=self.device
-            )
-            # For each request, gather sink [0, sink_size) and recent
-            # [seq_len - recent_size, seq_len) token locations
-            _build_sink_recent_indices[(bs,)](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                window_kv_indptr,
-                window_kv_indices,
-                self.sink_window_size,
-                self.local_window_size,
-                self.req_to_token.stride(0),
-            )
 
-            # For dual pool: translate window indices to comp pool locations
+            total_window = window_kv_indptr[-1].item()
+            window_kv_indices = self._window_kv_indices_buf[:total_window]
+            # Fused kernel: build sink+recent indices AND translate to comp pool
             if self.use_dual_pool:
-                window_kv_indices = kv_pool.translate_loc_full_to_comp(
-                    window_kv_indices
+                _build_sink_recent_comp_indices[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    window_kv_indptr,
+                    window_kv_indices,
+                    kv_pool.full_to_comp_mapping,
+                    self.sink_window_size,
+                    self.local_window_size,
+                    self.req_to_token.stride(0),
+                )
+            else:
+                _build_sink_recent_indices[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    window_kv_indptr,
+                    window_kv_indices,
+                    self.sink_window_size,
+                    self.local_window_size,
+                    self.req_to_token.stride(0),
                 )
 
-            # Allocate logits/lse buffers (using full num_head for max size)
-            attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            )
+            attn_logits = None
+            attn_lse = None
 
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(
@@ -467,7 +465,6 @@ class HeadReallocAttnBackend(AttentionBackend):
                 (bs, num_full_q, self.max_kv_splits),
                 dtype=torch.float32, device=self.device,
             )
-            num_kv_splits = self.forward_metadata.num_kv_splits
 
             self.decode_attention_fwd(
                 q_full,
@@ -478,7 +475,7 @@ class HeadReallocAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indices,
                 attn_logits,
                 attn_lse,
-                num_kv_splits,
+                self.forward_metadata.num_kv_splits,
                 self.max_kv_splits,
                 layer.scaling,
                 layer.logit_cap,
@@ -504,7 +501,6 @@ class HeadReallocAttnBackend(AttentionBackend):
                 (bs, num_comp_q, self.max_kv_splits),
                 dtype=torch.float32, device=self.device,
             )
-            window_num_kv_splits = self.forward_metadata.window_num_kv_splits
 
             self.decode_attention_fwd(
                 q_comp,
@@ -515,7 +511,7 @@ class HeadReallocAttnBackend(AttentionBackend):
                 self.forward_metadata.window_kv_indices,
                 attn_logits,
                 attn_lse,
-                window_num_kv_splits,
+                self.forward_metadata.window_num_kv_splits,
                 self.max_kv_splits,
                 layer.scaling,
                 layer.logit_cap,
@@ -700,6 +696,69 @@ def _build_sink_recent_indices(
                 data,
                 mask=mask,
             )
+
+
+@triton.jit
+def _build_sink_recent_comp_indices(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    kv_indptr,
+    kv_indices_ptr,
+    full_to_comp_mapping_ptr,
+    sink_size: tl.constexpr,
+    recent_size: tl.constexpr,
+    req_to_token_stride: tl.constexpr,
+):
+    """Build sink+recent indices and translate to comp pool in one kernel.
+
+    Fuses _build_sink_recent_indices + translate_loc_full_to_comp to
+    eliminate one kernel launch + one PyTorch indexing op.
+    """
+    BLOCK: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_pool_idx = tl.load(req_pool_indices_ptr + pid)
+    out_offset = tl.load(kv_indptr + pid)
+    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
+
+    total_window = sink_size + recent_size
+    if seq_len <= total_window:
+        num_loop = tl.cdiv(seq_len, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < seq_len
+            full_loc = tl.load(
+                req_to_token_ptr + req_pool_idx * req_to_token_stride + offset,
+                mask=mask,
+            )
+            comp_loc = tl.load(full_to_comp_mapping_ptr + full_loc, mask=mask).to(tl.int32)
+            tl.store(kv_indices_ptr + out_offset + offset, comp_loc, mask=mask)
+    else:
+        # Sink
+        num_loop = tl.cdiv(sink_size, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < sink_size
+            full_loc = tl.load(
+                req_to_token_ptr + req_pool_idx * req_to_token_stride + offset,
+                mask=mask,
+            )
+            comp_loc = tl.load(full_to_comp_mapping_ptr + full_loc, mask=mask).to(tl.int32)
+            tl.store(kv_indices_ptr + out_offset + offset, comp_loc, mask=mask)
+
+        # Recent
+        recent_start = seq_len - recent_size
+        num_loop = tl.cdiv(recent_size, BLOCK)
+        for i in range(num_loop):
+            offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
+            mask = offset < recent_size
+            full_loc = tl.load(
+                req_to_token_ptr + req_pool_idx * req_to_token_stride + recent_start + offset,
+                mask=mask,
+            )
+            comp_loc = tl.load(full_to_comp_mapping_ptr + full_loc, mask=mask).to(tl.int32)
+            tl.store(kv_indices_ptr + out_offset + sink_size + offset, comp_loc, mask=mask)
 
 
 # Reuse the triton kernel from mixed_triton_backend for kv_splits calculation

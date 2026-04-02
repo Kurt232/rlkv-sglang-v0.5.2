@@ -41,7 +41,7 @@ class MockModelRunner:
         self.gpu_id = 0
         attention_arch = AttentionArch.MHA
         max_batch_size = 32
-        max_context_len = 2048
+        max_context_len = 16384
         self.model_config = type(
             "ModelConfig",
             (),
@@ -501,5 +501,226 @@ class TestHeadReallocDualPoolDecode(unittest.TestCase):
         self.assertEqual(output.shape, (self.batch_size, self.num_heads * self.head_dim))
 
 
+def profile_decode_breakdown():
+    """Profile the breakdown of decode latency for head realloc vs standard attention.
+
+    Usage:
+        CUDA_VISIBLE_DEVICES=5 python test_head_realloc_backend.py --profile
+    """
+    import time
+
+    torch.manual_seed(42)
+    batch_size = 4
+    seq_len = 8192
+    num_heads = 8  # MHA: 8 KV heads = 8 Q heads (no GQA in this test)
+    head_dim = 128
+    device = "cuda"
+    dtype = torch.float16
+    num_layers = 1
+    warmup = 5
+    repeats = 50
+
+    with mock.patch(
+        "sglang.srt.layers.attention.head_realloc_backend.get_attention_tp_size",
+        return_value=1,
+    ):
+        # --- Setup: HeadRealloc backend (half full, half comp) ---
+        mask = torch.zeros(num_heads, device=device)
+        mask[:num_heads // 2] = 1.0
+        head_masks = {0: mask}
+
+        runner_hr = MockModelRunner(
+            num_heads=num_heads, head_dim=head_dim, head_masks=head_masks,
+        )
+        backend_hr = HeadReallocAttnBackend(runner_hr, head_masks)
+
+        layer = RadixAttention(
+            num_heads=num_heads, head_dim=head_dim,
+            scaling=1.0, num_kv_heads=num_heads, layer_id=0,
+        )
+
+        _setup_kv_cache_dual_pool(runner_hr, layer, batch_size, seq_len)
+        _mock_write_req_to_token(runner_hr, batch_size, seq_len + 1)
+
+        total_len = seq_len + 1
+        out_loc_hr = runner_hr.token_to_kv_pool_allocator.alloc(batch_size)
+
+        fb_hr = ForwardBatch(
+            batch_size=batch_size,
+            input_ids=torch.randint(0, 100, (batch_size, 1), device=device),
+            out_cache_loc=out_loc_hr,
+            seq_lens_sum=batch_size * total_len,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(batch_size, device=device),
+            seq_lens=torch.tensor([total_len] * batch_size, device=device),
+            seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
+            attn_backend=backend_hr,
+        )
+        fb_hr.req_to_token_pool = runner_hr.req_to_token_pool
+        fb_hr.token_to_kv_pool = runner_hr.token_to_kv_pool
+
+        # --- Setup: Reference backend (standard full attention) ---
+        runner_ref = MockModelRunner(
+            num_heads=num_heads, head_dim=head_dim, head_masks=None,
+        )
+        ref_backend = TorchNativeAttnBackend(runner_ref)
+
+        cache_k = torch.randn(batch_size * seq_len, num_heads, head_dim, dtype=dtype, device=device)
+        cache_v = torch.randn_like(cache_k)
+        ref_loc = torch.arange(batch_size * seq_len, device=device)
+        runner_ref.token_to_kv_pool.set_kv_buffer(layer, ref_loc, cache_k, cache_v)
+        _mock_write_req_to_token(runner_ref, batch_size, seq_len + 1)
+
+        ref_out_loc = torch.arange(batch_size * seq_len, batch_size * total_len, device=device)
+        fb_ref = ForwardBatch(
+            batch_size=batch_size,
+            input_ids=torch.randint(0, 100, (batch_size, 1), device=device),
+            out_cache_loc=ref_out_loc,
+            seq_lens_sum=batch_size * total_len,
+            forward_mode=ForwardMode.DECODE,
+            req_pool_indices=torch.arange(batch_size, device=device),
+            seq_lens=torch.tensor([total_len] * batch_size, device=device),
+            seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
+            attn_backend=ref_backend,
+        )
+        fb_ref.req_to_token_pool = runner_ref.req_to_token_pool
+        fb_ref.token_to_kv_pool = runner_ref.token_to_kv_pool
+
+        q = torch.randn(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+
+        # ======= Profile: init_forward_metadata =======
+        def bench(fn, label):
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(repeats):
+                fn()
+            torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - t0) / repeats * 1000
+            return elapsed
+
+        t_meta_hr = bench(lambda: backend_hr.init_forward_metadata(fb_hr), "HR init_meta")
+        t_meta_ref = bench(lambda: ref_backend.init_forward_metadata(fb_ref), "Ref init_meta")
+
+        # ======= Profile: forward_decode breakdown =======
+        # HeadRealloc: step-by-step profiling
+        backend_hr.init_forward_metadata(fb_hr)
+        ref_backend.init_forward_metadata(fb_ref)
+
+        layer_id = 0
+        full_q_idx = backend_hr.full_q_head_indices[layer_id]
+        comp_q_idx = backend_hr.comp_q_head_indices[layer_id]
+
+        def time_op(fn, label):
+            for _ in range(warmup):
+                fn()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(repeats):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) / repeats * 1000
+
+        # 1. KV write
+        t_kv_hr = time_op(
+            lambda: runner_hr.token_to_kv_pool.set_kv_buffer(layer, out_loc_hr, k, v),
+            "HR set_kv_buffer",
+        )
+        t_kv_ref = time_op(
+            lambda: runner_ref.token_to_kv_pool.set_kv_buffer(layer, ref_out_loc, cache_k[:batch_size], cache_v[:batch_size]),
+            "Ref set_kv_buffer",
+        )
+
+        # 2. Q gather
+        q_3d = q.view(batch_size, num_heads, head_dim)
+        t_q_gather = time_op(
+            lambda: (q_3d[:, full_q_idx, :].contiguous(), q_3d[:, comp_q_idx, :].contiguous()),
+            "Q gather x2",
+        )
+
+        # 3. Full heads attention kernel
+        q_full = q_3d[:, full_q_idx, :].contiguous()
+        k_buf_f, v_buf_f = backend_hr._get_kv_buffers(runner_hr.token_to_kv_pool, 0, "full")
+        o_part_f = torch.empty(batch_size, len(full_q_idx), head_dim, dtype=dtype, device=device)
+        al_f = torch.empty(batch_size, len(full_q_idx), backend_hr.max_kv_splits, head_dim, dtype=torch.float32, device=device)
+        alse_f = torch.empty(batch_size, len(full_q_idx), backend_hr.max_kv_splits, dtype=torch.float32, device=device)
+
+        t_attn_full = time_op(
+            lambda: backend_hr.decode_attention_fwd(
+                q_full, k_buf_f, v_buf_f, o_part_f,
+                backend_hr.forward_metadata.kv_indptr,
+                backend_hr.forward_metadata.kv_indices,
+                al_f, alse_f,
+                backend_hr.forward_metadata.num_kv_splits,
+                backend_hr.max_kv_splits, 1.0, 0.0,
+            ),
+            "Attn full heads",
+        )
+
+        # 4. Comp heads attention kernel
+        q_comp = q_3d[:, comp_q_idx, :].contiguous()
+        k_buf_c, v_buf_c = backend_hr._get_kv_buffers(runner_hr.token_to_kv_pool, 0, "comp")
+        o_part_c = torch.empty(batch_size, len(comp_q_idx), head_dim, dtype=dtype, device=device)
+        al_c = torch.empty(batch_size, len(comp_q_idx), backend_hr.max_kv_splits, head_dim, dtype=torch.float32, device=device)
+        alse_c = torch.empty(batch_size, len(comp_q_idx), backend_hr.max_kv_splits, dtype=torch.float32, device=device)
+
+        t_attn_comp = time_op(
+            lambda: backend_hr.decode_attention_fwd(
+                q_comp, k_buf_c, v_buf_c, o_part_c,
+                backend_hr.forward_metadata.window_kv_indptr,
+                backend_hr.forward_metadata.window_kv_indices,
+                al_c, alse_c,
+                backend_hr.forward_metadata.window_num_kv_splits,
+                backend_hr.max_kv_splits, 1.0, 0.0,
+            ),
+            "Attn comp heads",
+        )
+
+        # 5. Output scatter
+        o_full = torch.empty(batch_size, num_heads, head_dim, dtype=dtype, device=device)
+        t_scatter = time_op(
+            lambda: (o_full.__setitem__((slice(None), full_q_idx, slice(None)), o_part_f),
+                     o_full.__setitem__((slice(None), comp_q_idx, slice(None)), o_part_c)),
+            "Output scatter x2",
+        )
+
+        # 6. Reference full forward_decode (end-to-end)
+        t_ref_e2e = time_op(
+            lambda: ref_backend.forward_decode(q.clone(), k.clone(), v.clone(), layer, fb_ref),
+            "Ref forward_decode",
+        )
+        t_hr_e2e = time_op(
+            lambda: backend_hr.forward_decode(q.clone(), k.clone(), v.clone(), layer, fb_hr),
+            "HR forward_decode",
+        )
+
+        # ======= Report =======
+        print(f"\n{'='*65}")
+        print(f"Decode Latency Breakdown (bs={batch_size}, seq={seq_len}, heads={num_heads}, avg of {repeats} runs)")
+        print(f"{'='*65}")
+        print(f"{'Operation':<35} {'HeadRealloc':>12} {'Reference':>12}")
+        print(f"{'-'*65}")
+        print(f"{'init_forward_metadata':<35} {t_meta_hr:>10.3f}ms {t_meta_ref:>10.3f}ms")
+        print(f"{'set_kv_buffer':<35} {t_kv_hr:>10.3f}ms {t_kv_ref:>10.3f}ms")
+        print(f"{'Q gather (x2 contiguous)':<35} {t_q_gather:>10.3f}ms {'N/A':>12}")
+        print(f"{'Attention (full heads)':<35} {t_attn_full:>10.3f}ms {'':>12}")
+        print(f"{'Attention (comp heads)':<35} {t_attn_comp:>10.3f}ms {'':>12}")
+        print(f"{'Output scatter (x2)':<35} {t_scatter:>10.3f}ms {'N/A':>12}")
+        print(f"{'-'*65}")
+        t_hr_parts = t_kv_hr + t_q_gather + t_attn_full + t_attn_comp + t_scatter
+        print(f"{'Sum of parts':<35} {t_hr_parts:>10.3f}ms {'':>12}")
+        print(f"{'End-to-end forward_decode':<35} {t_hr_e2e:>10.3f}ms {t_ref_e2e:>10.3f}ms")
+        print(f"{'Overhead':<35} {t_hr_e2e - t_ref_e2e:>10.3f}ms {t_hr_e2e/t_ref_e2e:>11.2f}x")
+        print(f"{'='*65}")
+
+
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    if "--profile" in sys.argv:
+        sys.argv.remove("--profile")
+        profile_decode_breakdown()
+    else:
+        unittest.main()
