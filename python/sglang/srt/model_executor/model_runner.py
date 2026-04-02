@@ -1604,13 +1604,20 @@ class ModelRunner:
                     rlkv_full_pool_size, self.max_total_num_tokens
                 )
 
+                # Comp cost per request in full-token equivalents
+                self.rlkv_window_equiv = (
+                    window * total_comp_heads // total_full_heads
+                    if total_full_heads > 0 else 0
+                )
+
                 logger.info(
                     f"RLKV memory rebalancing: "
                     f"full_pool={rlkv_full_pool_size} "
                     f"({rlkv_full_pool_size/self.max_total_num_tokens:.2f}x), "
                     f"comp_pool={rlkv_comp_pool_size} "
                     f"(max_concurrent={rlkv_max_concurrent} × window={window}), "
-                    f"T_full={total_full_heads}, T_comp={total_comp_heads}"
+                    f"T_full={total_full_heads}, T_comp={total_comp_heads}, "
+                    f"window_equiv={self.rlkv_window_equiv}"
                 )
                 self.max_total_num_tokens = rlkv_full_pool_size
 
@@ -1676,6 +1683,7 @@ class ModelRunner:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                             window_size=rlkv_window,
+                            window_equiv=self.rlkv_window_equiv,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(

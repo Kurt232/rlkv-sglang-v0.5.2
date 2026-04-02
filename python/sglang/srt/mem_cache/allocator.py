@@ -308,11 +308,13 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         kvcache,
         need_sort: bool,
         window_size: int = 80,
+        window_equiv: int = 80,
     ):
         super().__init__(size_full, 1, dtype, device, kvcache, need_sort)
         self._size_full = size_full
         self._size_comp = size_comp
         self.window_size = window_size
+        self.window_equiv = window_equiv  # comp cost per request in full-token equivalents
 
         self.full_allocator = TokenToKVPoolAllocator(
             size_full, dtype, device, kvcache, need_sort,
@@ -323,6 +325,8 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         # comp_base = 1 + chunk_id * window_size.
         self.max_comp_chunks = size_comp // window_size if window_size > 0 else 0
         self._comp_free_chunks = None  # initialized in clear()
+        self._comp_allocated = None    # set of allocated chunk_ids (guards double-free)
+        self._num_active_comp_reqs = 0
 
         # Mapping from full pool loc → comp pool loc.
         # Populated by the attention backend in init_forward_metadata.
@@ -335,7 +339,9 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_comp_mapping = self.full_to_comp_mapping
 
     def available_size(self):
-        return self.full_allocator.available_size()
+        full_avail = self.full_allocator.available_size()
+        comp_deduction = self._num_active_comp_reqs * self.window_equiv
+        return max(0, full_avail - comp_deduction)
 
     def comp_chunks_available(self):
         return len(self._comp_free_chunks) if self._comp_free_chunks else 0
@@ -351,14 +357,18 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         if not self._comp_free_chunks:
             return 0
         chunk_id = self._comp_free_chunks.pop()
+        self._comp_allocated.add(chunk_id)
+        self._num_active_comp_reqs += 1
         return 1 + chunk_id * self.window_size
 
     def free_comp_window(self, comp_base: int):
-        """Free a window-sized comp chunk."""
+        """Free a window-sized comp chunk. Idempotent (guards double-free)."""
         if comp_base > 0 and self.window_size > 0:
             chunk_id = (comp_base - 1) // self.window_size
-            if chunk_id < self.max_comp_chunks:
+            if chunk_id in self._comp_allocated:
+                self._comp_allocated.discard(chunk_id)
                 self._comp_free_chunks.append(chunk_id)
+                self._num_active_comp_reqs -= 1
 
     def alloc(self, need_size: int):
         """Allocate from full pool only. Comp is managed per-request."""
@@ -387,6 +397,8 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         self.full_allocator.clear()
         self.full_to_comp_mapping.fill_(0)
         self._comp_free_chunks = list(range(self.max_comp_chunks))
+        self._comp_allocated = set()
+        self._num_active_comp_reqs = 0
         self.is_not_in_free_group = True
         self.free_group = []
 
