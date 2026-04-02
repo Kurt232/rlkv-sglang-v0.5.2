@@ -846,6 +846,49 @@ class SWAKVPool(KVCache):
             )
 
 
+@triton.jit
+def _fused_kv_write(
+    cache_k_ptr, cache_v_ptr,
+    full_k_ptr, full_v_ptr,
+    comp_k_ptr, comp_v_ptr,
+    loc_ptr, comp_loc_ptr,
+    full_head_idx_ptr, comp_head_idx_ptr,
+    src_stride_tok, src_stride_head,
+    full_stride_tok, full_stride_head,
+    comp_stride_tok, comp_stride_head,
+    num_full_kv, num_comp_kv,
+    BLOCK_D: tl.constexpr,
+    MAX_HEADS: tl.constexpr,
+):
+    """Fused KV write: split incoming KV by head group into full+comp pools.
+
+    Replaces 5 PyTorch ops (1 translate + 4 indexed writes with head selection)
+    with a single triton kernel.
+    """
+    tid = tl.program_id(0)
+    full_loc = tl.load(loc_ptr + tid).to(tl.int64)
+    comp_loc = tl.load(comp_loc_ptr + tid).to(tl.int64)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # Write full heads: full_head_idx[local_h] -> original head index
+    for local_h in tl.static_range(0, MAX_HEADS):
+        if local_h < num_full_kv:
+            src_h = tl.load(full_head_idx_ptr + local_h).to(tl.int64)
+            src_off = tid * src_stride_tok + src_h * src_stride_head + offs_d
+            dst_off = full_loc * full_stride_tok + local_h * full_stride_head + offs_d
+            tl.store(full_k_ptr + dst_off, tl.load(cache_k_ptr + src_off))
+            tl.store(full_v_ptr + dst_off, tl.load(cache_v_ptr + src_off))
+
+    # Write comp heads: comp_head_idx[local_h] -> original head index
+    for local_h in tl.static_range(0, MAX_HEADS):
+        if local_h < num_comp_kv:
+            src_h = tl.load(comp_head_idx_ptr + local_h).to(tl.int64)
+            src_off = tid * src_stride_tok + src_h * src_stride_head + offs_d
+            dst_off = comp_loc * comp_stride_tok + local_h * comp_stride_head + offs_d
+            tl.store(comp_k_ptr + dst_off, tl.load(cache_k_ptr + src_off))
+            tl.store(comp_v_ptr + dst_off, tl.load(cache_v_ptr + src_off))
+
+
 class HeadReallocKVPool(KVCache):
     """KV cache with separate pools for full and compressed attention heads.
 
@@ -982,19 +1025,22 @@ class HeadReallocKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        full_idx = self.full_head_indices[layer_id]
-        comp_idx = self.comp_head_indices[layer_id]
-
-        # Write full heads to full pool
-        if len(full_idx) > 0:
-            self.full_k_buffer[layer_id][loc] = cache_k[:, full_idx, :]
-            self.full_v_buffer[layer_id][loc] = cache_v[:, full_idx, :]
-
-        # Write comp heads to comp pool (translate location)
-        if len(comp_idx) > 0:
-            comp_loc = self.translate_loc_full_to_comp(loc)
-            self.comp_k_buffer[layer_id][comp_loc] = cache_k[:, comp_idx, :]
-            self.comp_v_buffer[layer_id][comp_loc] = cache_v[:, comp_idx, :]
+        num_full = len(self.full_head_indices[layer_id])
+        num_comp = len(self.comp_head_indices[layer_id])
+        comp_loc = self.translate_loc_full_to_comp(loc)
+        _fused_kv_write[(loc.shape[0],)](
+            cache_k, cache_v,
+            self.full_k_buffer[layer_id], self.full_v_buffer[layer_id],
+            self.comp_k_buffer[layer_id], self.comp_v_buffer[layer_id],
+            loc, comp_loc,
+            self.full_head_indices[layer_id], self.comp_head_indices[layer_id],
+            cache_k.stride(0), cache_k.stride(1),
+            self.full_k_buffer[layer_id].stride(0), self.full_k_buffer[layer_id].stride(1),
+            self.comp_k_buffer[layer_id].stride(0), self.comp_k_buffer[layer_id].stride(1),
+            num_full, num_comp,
+            BLOCK_D=self.head_dim,
+            MAX_HEADS=num_full + num_comp,
+        )
 
 
 class AscendTokenToKVPool(MHATokenToKVPool):
