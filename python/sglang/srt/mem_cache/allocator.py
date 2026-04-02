@@ -290,9 +290,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for head reallocation dual KV pool.
 
-    Manages two sub-allocators: one for full-attention heads (full capacity)
-    and one for compressed heads (smaller capacity for window tokens).
-    Maintains a mapping from full pool locations to comp pool locations.
+    Manages the full pool via standard alloc/free. Comp pool uses
+    chunk-based allocation: each request gets a fixed window of comp
+    slots (allocated by the attention backend on first extend,
+    freed automatically when request tokens are freed).
+
+    The full_to_comp_mapping is populated by the attention backend
+    using circular addressing within each request's comp window.
     """
 
     def __init__(
@@ -303,24 +307,27 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache,
         need_sort: bool,
-        sink_size: int = 16,
-        recent_size: int = 64,
+        window_size: int = 80,
     ):
         super().__init__(size_full, 1, dtype, device, kvcache, need_sort)
         self._size_full = size_full
         self._size_comp = size_comp
-        self.sink_size = sink_size
-        self.recent_size = recent_size
+        self.window_size = window_size
 
         self.full_allocator = TokenToKVPoolAllocator(
             size_full, dtype, device, kvcache, need_sort,
         )
-        self.comp_allocator = TokenToKVPoolAllocator(
-            size_comp, dtype, device, kvcache, need_sort,
-        )
 
-        self.full_to_comp_mapping = torch.empty(
-            size_full + size_comp + 2,
+        # Comp pool chunk management.
+        # Each chunk is window_size contiguous comp slots.
+        # comp_base = 1 + chunk_id * window_size.
+        self.max_comp_chunks = size_comp // window_size if window_size > 0 else 0
+        self._comp_free_chunks = None  # initialized in clear()
+
+        # Mapping from full pool loc → comp pool loc.
+        # Populated by the attention backend in init_forward_metadata.
+        self.full_to_comp_mapping = torch.zeros(
+            size_full + 2,
             dtype=torch.int64,
             device=device,
         )
@@ -328,61 +335,58 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.full_to_comp_mapping = self.full_to_comp_mapping
 
     def available_size(self):
-        # Scheduling is based on full pool capacity; comp pool is managed
-        # separately via eviction.
         return self.full_allocator.available_size()
 
-    def full_available_size(self):
-        return self.full_allocator.available_size()
-
-    def comp_available_size(self):
-        return self.comp_allocator.available_size()
-
-    @property
-    def size_full(self):
-        return self._size_full
-
-    @property
-    def size_comp(self):
-        return self._size_comp
+    def comp_chunks_available(self):
+        return len(self._comp_free_chunks) if self._comp_free_chunks else 0
 
     def debug_print(self) -> str:
         return (
             f"#full-available: {self.full_allocator.available_size()}, "
-            f"#comp-available: {self.comp_allocator.available_size()}"
+            f"#comp-chunks: {self.comp_chunks_available()}/{self.max_comp_chunks}"
         )
 
-    def alloc(self, need_size: int):
-        if need_size > self.full_allocator.available_size():
-            return None
-        if need_size > self.comp_allocator.available_size():
-            return None
+    def alloc_comp_window(self) -> int:
+        """Allocate a window-sized comp chunk. Returns comp_base (>0) or 0 if full."""
+        if not self._comp_free_chunks:
+            return 0
+        chunk_id = self._comp_free_chunks.pop()
+        return 1 + chunk_id * self.window_size
 
-        full_indices = self.full_allocator.alloc(need_size)
-        comp_indices = self.comp_allocator.alloc(need_size)
-        self.full_to_comp_mapping[full_indices] = comp_indices
-        return full_indices
+    def free_comp_window(self, comp_base: int):
+        """Free a window-sized comp chunk."""
+        if comp_base > 0 and self.window_size > 0:
+            chunk_id = (comp_base - 1) // self.window_size
+            if chunk_id < self.max_comp_chunks:
+                self._comp_free_chunks.append(chunk_id)
+
+    def alloc(self, need_size: int):
+        """Allocate from full pool only. Comp is managed per-request."""
+        return self.full_allocator.alloc(need_size)
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
         if self.is_not_in_free_group:
             self.full_allocator.free(free_index)
-            self.free_comp(free_index)
+            # Free comp chunks by deriving comp_base from mapping
+            comp_indices = self.full_to_comp_mapping[free_index]
+            non_zero = comp_indices[comp_indices > 0]
+            if non_zero.numel() > 0:
+                comp_bases = (
+                    (non_zero - 1) // self.window_size * self.window_size + 1
+                )
+                unique_bases = torch.unique(comp_bases)
+                for cb in unique_bases.tolist():
+                    self.free_comp_window(cb)
+            self.full_to_comp_mapping[free_index] = 0
         else:
             self.free_group.append(free_index)
 
-    def free_comp(self, free_index: torch.Tensor):
-        """Free only the comp pool locations corresponding to the given full pool indices."""
-        comp_indices = self.full_to_comp_mapping[free_index]
-        comp_indices = comp_indices[comp_indices > 0]
-        self.comp_allocator.free(comp_indices)
-        self.full_to_comp_mapping[free_index] = 0
-
     def clear(self):
         self.full_allocator.clear()
-        self.comp_allocator.clear()
         self.full_to_comp_mapping.fill_(0)
+        self._comp_free_chunks = list(range(self.max_comp_chunks))
         self.is_not_in_free_group = True
         self.free_group = []
 
