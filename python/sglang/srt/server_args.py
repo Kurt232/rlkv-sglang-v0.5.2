@@ -1935,7 +1935,6 @@ class ServerArgs:
             help="Sparsity level for RLKV head binarization (0-1). "
             "Higher means more heads are compressed.",
         )
-
         # Optimization/debug options
         parser.add_argument(
             "--disable-radix-cache",

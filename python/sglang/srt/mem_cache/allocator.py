@@ -307,7 +307,7 @@ class HeadReallocAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache,
         need_sort: bool,
-        window_size: int = 80,
+        window_size: int,
     ):
         super().__init__(size_full, 1, dtype, device, kvcache, need_sort)
         self._size_full = size_full
