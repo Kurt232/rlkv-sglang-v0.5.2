@@ -261,6 +261,24 @@ class HeadReallocAttnBackend(AttentionBackend):
             comp_bases + comp_offsets,
             torch.zeros_like(comp_offsets),
         )
+        # Mask out CUDA-graph padding rows.
+        # CG replay fills padding seq_lens with seq_len_fill_value=1 but does
+        # NOT reset req_pool_indices (cuda_graph_runner.py:733-741 only zeros
+        # seq_lens and out_cache_loc). Stale req_pool_indices land on
+        # req_to_token entries from finished requests, whose full slots may
+        # have been recycled to a *different* active request at a non-sink
+        # position. Without this mask, we overwrite that request's
+        # full_to_comp_mapping entry, corrupting its recent-window K reads.
+        # Real decode positions always have seq_lens >= 2 (prefill ≥ 1 token
+        # then seq_lens is pre-incremented), so seq_lens == 1 reliably flags
+        # padding rows.
+        is_real = seq_lens[:bs] > 1
+        out_cache_loc = torch.where(
+            is_real, out_cache_loc, torch.zeros_like(out_cache_loc)
+        )
+        comp_indices = torch.where(
+            is_real, comp_indices, torch.zeros_like(comp_indices)
+        )
         kv_pool.full_to_comp_mapping[out_cache_loc] = comp_indices
 
     def _update_comp_mapping_extend(
