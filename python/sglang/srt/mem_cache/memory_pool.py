@@ -853,7 +853,8 @@ def _fused_kv_write(
     comp_k_ptr, comp_v_ptr,
     loc_ptr, comp_loc_ptr,
     full_head_idx_ptr, comp_head_idx_ptr,
-    src_stride_tok, src_stride_head,
+    src_k_stride_tok, src_k_stride_head,
+    src_v_stride_tok, src_v_stride_head,
     full_stride_tok, full_stride_head,
     comp_stride_tok, comp_stride_head,
     num_full_kv, num_comp_kv,
@@ -864,6 +865,11 @@ def _fused_kv_write(
 
     Replaces 5 PyTorch ops (1 translate + 4 indexed writes with head selection)
     with a single triton kernel.
+
+    K and V get independent (tok, head) strides: with Q/K-Norm (e.g. Qwen3) the
+    norm reshapes K into a fresh contiguous tensor while V stays a strided view
+    of the fused qkv buffer, so the two no longer share a layout. Threading both
+    stride pairs keeps the write zero-copy for every model.
     """
     tid = tl.program_id(0)
     full_loc = tl.load(loc_ptr + tid).to(tl.int64)
@@ -874,19 +880,21 @@ def _fused_kv_write(
     for local_h in tl.static_range(0, MAX_HEADS):
         if local_h < num_full_kv:
             src_h = tl.load(full_head_idx_ptr + local_h).to(tl.int64)
-            src_off = tid * src_stride_tok + src_h * src_stride_head + offs_d
+            src_k_off = tid * src_k_stride_tok + src_h * src_k_stride_head + offs_d
+            src_v_off = tid * src_v_stride_tok + src_h * src_v_stride_head + offs_d
             dst_off = full_loc * full_stride_tok + local_h * full_stride_head + offs_d
-            tl.store(full_k_ptr + dst_off, tl.load(cache_k_ptr + src_off))
-            tl.store(full_v_ptr + dst_off, tl.load(cache_v_ptr + src_off))
+            tl.store(full_k_ptr + dst_off, tl.load(cache_k_ptr + src_k_off))
+            tl.store(full_v_ptr + dst_off, tl.load(cache_v_ptr + src_v_off))
 
     # Write comp heads: comp_head_idx[local_h] -> original head index
     for local_h in tl.static_range(0, MAX_HEADS):
         if local_h < num_comp_kv:
             src_h = tl.load(comp_head_idx_ptr + local_h).to(tl.int64)
-            src_off = tid * src_stride_tok + src_h * src_stride_head + offs_d
+            src_k_off = tid * src_k_stride_tok + src_h * src_k_stride_head + offs_d
+            src_v_off = tid * src_v_stride_tok + src_h * src_v_stride_head + offs_d
             dst_off = comp_loc * comp_stride_tok + local_h * comp_stride_head + offs_d
-            tl.store(comp_k_ptr + dst_off, tl.load(cache_k_ptr + src_off))
-            tl.store(comp_v_ptr + dst_off, tl.load(cache_v_ptr + src_off))
+            tl.store(comp_k_ptr + dst_off, tl.load(cache_k_ptr + src_k_off))
+            tl.store(comp_v_ptr + dst_off, tl.load(cache_v_ptr + src_v_off))
 
 
 class HeadReallocKVPool(KVCache):
@@ -1025,6 +1033,13 @@ class HeadReallocKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
+        # _fused_kv_write takes independent K and V (tok, head) strides. With
+        # Q/K-Norm (e.g. Qwen3), q_norm/k_norm reshape K into a fresh contiguous
+        # tensor while V stays a strided view of the fused qkv buffer, so K and V
+        # carry DIFFERENT token strides (K: num_kv_heads*head_dim, V: q+2*kv
+        # width). Models without Q/K-Norm (Llama, Qwen2.5) keep both as
+        # same-stride qkv views (in-place RoPE preserves stride). Threading both
+        # stride pairs handles either case zero-copy.
         num_full = len(self.full_head_indices[layer_id])
         num_comp = len(self.comp_head_indices[layer_id])
         comp_loc = self.translate_loc_full_to_comp(loc)
@@ -1035,6 +1050,7 @@ class HeadReallocKVPool(KVCache):
             loc, comp_loc,
             self.full_head_indices[layer_id], self.comp_head_indices[layer_id],
             cache_k.stride(0), cache_k.stride(1),
+            cache_v.stride(0), cache_v.stride(1),
             self.full_k_buffer[layer_id].stride(0), self.full_k_buffer[layer_id].stride(1),
             self.comp_k_buffer[layer_id].stride(0), self.comp_k_buffer[layer_id].stride(1),
             num_full, num_comp,
